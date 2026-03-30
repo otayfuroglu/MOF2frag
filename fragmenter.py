@@ -332,45 +332,51 @@ def get_fragment(core_metals, initial_indices, supercell, sc_center_idx, metals,
         # ==========================================
         # ADVANCED MINIMIZED PRUNING
         # ==========================================
+        partial_to_remove = set()
+        bridge_atoms_to_cap = []
         linker_evaluations = []
-        kept_any_full_linker = False
-        
+
         for comp in components:
             touching_metals = set()
             bridge_atoms = set()
-            metal_bond_count = 0
             for atom_idx in comp:
                 for nb in local_adj[atom_idx]:
                     if nb in core_metals:
                         touching_metals.add(nb)
                         bridge_atoms.add(atom_idx)
-                        metal_bond_count += 1
-                        
+
+            # Strict dangling-linker removal:
+            # if a component touches <2 distinct core metals, keep only the
+            # first-shell bridge atoms (typically O) and cap them.
+            if len(touching_metals) < 2:
+                atoms_to_cut = comp - bridge_atoms
+                partial_to_remove.update(atoms_to_cut)
+                for ba in bridge_atoms:
+                    removed_neighbor_coords = []
+                    for nb in local_adj[ba]:
+                        if nb in atoms_to_cut:
+                            removed_neighbor_coords.append(unwrapped_coords[nb])
+                    if removed_neighbor_coords:
+                        bridge_atoms_to_cap.append((ba, removed_neighbor_coords))
+                continue
+
             keep_linker = False
-            # A valid linker must have at least two metal-linker bonds.
-            # This removes components that are attached by only one bond.
-            if metal_bond_count >= 2 and len(touching_metals) >= 2:
-                touched_coords = [supercell[m].coords for m in touching_metals]
-                max_dist = 0
-                for i in range(len(touched_coords)):
-                    for j in range(i+1, len(touched_coords)):
-                        d = np.linalg.norm(touched_coords[i] - touched_coords[j])
-                        if d > max_dist: max_dist = d
-                if max_dist > 4.5:
-                    keep_linker = True
-                    
-            if keep_linker:
-                kept_any_full_linker = True
-                
+            touched_coords = [supercell[m].coords for m in touching_metals]
+            max_dist = 0
+            for i in range(len(touched_coords)):
+                for j in range(i+1, len(touched_coords)):
+                    d = np.linalg.norm(touched_coords[i] - touched_coords[j])
+                    if d > max_dist: max_dist = d
+            if max_dist > 4.5:
+                keep_linker = True
+
             linker_evaluations.append((comp, bridge_atoms, keep_linker))
             
+        kept_any_full_linker = any(keep for _, _, keep in linker_evaluations)
         if not kept_any_full_linker and linker_evaluations:
             linker_evaluations.sort(key=lambda x: len(x[0]), reverse=True)
             best_comp, best_ba, _ = linker_evaluations[0]
             linker_evaluations[0] = (best_comp, best_ba, True)
-            
-        partial_to_remove = set()
-        bridge_atoms_to_cap = []
         
         for comp, bridge_atoms, keep_linker in linker_evaluations:
             if not keep_linker:
@@ -419,15 +425,14 @@ def get_fragment(core_metals, initial_indices, supercell, sc_center_idx, metals,
         for comp in components:
             touching_metals = set()
             bridge_atoms = set()
-            metal_bond_count = 0
             for atom_idx in comp:
                 for nb in local_adj[atom_idx]:
                     if nb in core_metals:
                         touching_metals.add(nb)
                         bridge_atoms.add(atom_idx)
-                        metal_bond_count += 1
-            # Eliminate linker components connected by only one metal bond.
-            if metal_bond_count < 2:
+            # Eliminate components connected to only one (or zero) core metals.
+            # Keep first-shell bridge atoms and cap them.
+            if len(touching_metals) < 2:
                 atoms_to_cut = comp - bridge_atoms
                 partial_to_remove.update(atoms_to_cut)
                 for ba in bridge_atoms:
