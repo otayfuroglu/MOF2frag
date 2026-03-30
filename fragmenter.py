@@ -338,14 +338,18 @@ def get_fragment(core_metals, initial_indices, supercell, sc_center_idx, metals,
         for comp in components:
             touching_metals = set()
             bridge_atoms = set()
+            metal_bond_count = 0
             for atom_idx in comp:
                 for nb in local_adj[atom_idx]:
                     if nb in core_metals:
                         touching_metals.add(nb)
                         bridge_atoms.add(atom_idx)
+                        metal_bond_count += 1
                         
             keep_linker = False
-            if len(touching_metals) >= 2:
+            # A valid linker must have at least two metal-linker bonds.
+            # This removes components that are attached by only one bond.
+            if metal_bond_count >= 2 and len(touching_metals) >= 2:
                 touched_coords = [supercell[m].coords for m in touching_metals]
                 max_dist = 0
                 for i in range(len(touched_coords)):
@@ -415,12 +419,15 @@ def get_fragment(core_metals, initial_indices, supercell, sc_center_idx, metals,
         for comp in components:
             touching_metals = set()
             bridge_atoms = set()
+            metal_bond_count = 0
             for atom_idx in comp:
                 for nb in local_adj[atom_idx]:
                     if nb in core_metals:
                         touching_metals.add(nb)
                         bridge_atoms.add(atom_idx)
-            if len(touching_metals) < 2:
+                        metal_bond_count += 1
+            # Eliminate linker components connected by only one metal bond.
+            if metal_bond_count < 2:
                 atoms_to_cut = comp - bridge_atoms
                 partial_to_remove.update(atoms_to_cut)
                 for ba in bridge_atoms:
@@ -440,9 +447,7 @@ def get_fragment(core_metals, initial_indices, supercell, sc_center_idx, metals,
     sites = [supercell[idx] for idx in ordered_indices]
     species = [s.species_string for s in sites]
     coords = [unwrapped_coords[idx] for idx in ordered_indices]
-    # Track metadata only for H atoms we add during capping.
-    h_parent = [None] * len(species)
-    is_capping_h = [False] * len(species)
+    local_index = {sc_idx: i for i, sc_idx in enumerate(ordered_indices)}
     
     bonds_by_ligand = {}
     for lid, unwrapped_m_pos in broken_bonds:
@@ -456,20 +461,85 @@ def get_fragment(core_metals, initial_indices, supercell, sc_center_idx, metals,
             return 1.01
         return 0.96
 
+    def _orthonormal_basis(u):
+        trial = np.array([1.0, 0.0, 0.0])
+        if abs(np.dot(u, trial)) > 0.9:
+            trial = np.array([0.0, 1.0, 0.0])
+        e1 = np.cross(u, trial)
+        n1 = np.linalg.norm(e1)
+        if n1 < 1e-12:
+            e1 = np.array([0.0, 0.0, 1.0])
+            n1 = np.linalg.norm(e1)
+        e1 = e1 / n1
+        e2 = np.cross(u, e1)
+        e2 = e2 / np.linalg.norm(e2)
+        return e1, e2
+
+    def _score_candidate_h(candidate_pos, parent_idx):
+        min_h = float("inf")
+        min_heavy = float("inf")
+        for i, s in enumerate(species):
+            d = np.linalg.norm(candidate_pos - np.array(coords[i]))
+            if s == "H":
+                if d < min_h:
+                    min_h = d
+            else:
+                if i != parent_idx and d < min_heavy:
+                    min_heavy = d
+        return min_h, min_heavy
+
+    def place_capping_h(parent_idx, base_vec, bl, min_hh=1.5, min_heavy=0.9):
+        parent_pos = np.array(coords[parent_idx])
+        vnorm = np.linalg.norm(base_vec)
+        if vnorm < 1e-12:
+            return
+        u = base_vec / vnorm
+        e1, e2 = _orthonormal_basis(u)
+
+        theta_list = [0.0, 20.0, 35.0, 50.0, 65.0, 80.0, 110.0, 140.0, 170.0]
+        phi_list = [0.0, 60.0, 120.0, 180.0, 240.0, 300.0]
+        directions = []
+        for th in theta_list:
+            th_r = np.deg2rad(th)
+            ct, st = np.cos(th_r), np.sin(th_r)
+            if th == 0.0:
+                directions.append(u)
+            else:
+                for ph in phi_list:
+                    ph_r = np.deg2rad(ph)
+                    dir_vec = ct * u + st * (np.cos(ph_r) * e1 + np.sin(ph_r) * e2)
+                    directions.append(dir_vec / np.linalg.norm(dir_vec))
+
+        best_pos = None
+        best_tuple = (-1.0, -1.0)
+        for dvec in directions:
+            cand = parent_pos + dvec * bl
+            mh, mheavy = _score_candidate_h(cand, parent_idx)
+            if mh >= min_hh and mheavy >= min_heavy:
+                species.append("H")
+                coords.append(cand)
+                return
+            rank = (mh, mheavy)
+            if rank > best_tuple:
+                best_tuple = rank
+                best_pos = cand
+
+        # Fallback: place best available direction rather than dropping H.
+        if best_pos is not None:
+            species.append("H")
+            coords.append(best_pos)
+
     for ba_idx, removed_coords in bridge_atoms_to_cap:
         ba_site = supercell[ba_idx]
-        ba_pos = unwrapped_coords[ba_idx]
+        ba_pos = np.array(unwrapped_coords[ba_idx])
         bl = cap_bond_length(ba_site.species_string)
-        # Add one H per severed bond direction to avoid vector-cancellation
-        # artifacts that can miss required capping on carbons in --minimize mode.
+        parent_local_idx = local_index.get(ba_idx)
+        if parent_local_idx is None:
+            # Parent atom may not be in ordered_indices if pruned unexpectedly.
+            continue
         for rc in removed_coords:
             vec = rc - ba_pos
-            d = np.linalg.norm(vec)
-            if d > 0:
-                species.append("H")
-                coords.append(ba_pos + (vec / d) * bl)
-                h_parent.append(ba_idx)
-                is_capping_h.append(True)
+            place_capping_h(parent_local_idx, vec, bl, min_hh=1.5)
     
     already_capped = {ba_idx for ba_idx, _ in bridge_atoms_to_cap}
         
@@ -489,57 +559,10 @@ def get_fragment(core_metals, initial_indices, supercell, sc_center_idx, metals,
             avg_vec = avg_vec + (c - lpos)
         dist = np.linalg.norm(avg_vec)
         if dist > 0:
-            unit_vec = avg_vec / dist
             bl = cap_bond_length(lsite.species_string)
-            species.append("H")
-            coords.append(lpos + unit_vec * bl)
-            h_parent.append(lid)
-            is_capping_h.append(True)
-    
-    # Resolve close H-H contacts where at least one atom is a capping hydrogen.
-    # Prefer keeping native H when it clashes with capping H, and otherwise keep
-    # the capping H with better clearance from other heavy atoms.
-    h_indices = [i for i, s in enumerate(species) if s == "H"]
-    heavy_indices = [i for i, s in enumerate(species) if s != "H"]
-
-    def clearance_score(h_idx):
-        hp = h_parent[h_idx]
-        best = float("inf")
-        hpos = np.array(coords[h_idx])
-        for k in heavy_indices:
-            if k == hp:
-                continue
-            d = np.linalg.norm(hpos - np.array(coords[k]))
-            if d < best:
-                best = d
-        return best
-
-    remove_set = set()
-    for i in range(len(h_indices)):
-        if h_indices[i] in remove_set: continue
-        for j in range(i + 1, len(h_indices)):
-            if h_indices[j] in remove_set: continue
-            hi = h_indices[i]
-            hj = h_indices[j]
-            if not (is_capping_h[hi] or is_capping_h[hj]):
-                continue
-            d = np.linalg.norm(np.array(coords[hi]) - np.array(coords[hj]))
-            if d < 2.0:
-                if is_capping_h[hi] and not is_capping_h[hj]:
-                    remove_set.add(hi)
-                    break
-                if is_capping_h[hj] and not is_capping_h[hi]:
-                    remove_set.add(hj)
-                    continue
-                si = clearance_score(hi)
-                sj = clearance_score(hj)
-                if si < sj:
-                    remove_set.add(hi)
-                    break
-                remove_set.add(hj)
-    if remove_set:
-        species = [s for i, s in enumerate(species) if i not in remove_set]
-        coords = [c for i, c in enumerate(coords) if i not in remove_set]
+            parent_local_idx = local_index.get(lid)
+            if parent_local_idx is not None:
+                place_capping_h(parent_local_idx, avg_vec, bl, min_hh=1.5)
             
     return species, coords
 
