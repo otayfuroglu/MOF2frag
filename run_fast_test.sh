@@ -52,19 +52,19 @@ echo ""
 # One representative MOF per family
 MOF74_CIF="$(dirname "$0")/test/1516648.cif"
 IRMOF_CIF="$(dirname "$0")/test_on_irmof_series/IRMOF-1.cif"
-MIL_CIF="$(dirname "$0")/test_on_mil_series/MIL-101.cif"
+MIL_CIF="$(dirname "$0")/test_on_mil_series/MIL-100.cif"
 PCN_CIF="$(dirname "$0")/test_on_pcn_series/PCN-60.cif"
 
 echo -e "${CYAN}Normal mode${NC}"
 run_test "MOF-74: 1516648" "$MOF74_CIF" 4.0 3 ""
 run_test "IRMOF: IRMOF-1" "$IRMOF_CIF" 4.0 3 ""
-run_test "MIL: MIL-101" "$MIL_CIF" 4.0 3 ""
+run_test "MIL: MIL-100" "$MIL_CIF" 4.0 3 ""
 run_test "PCN: PCN-60" "$PCN_CIF" 4.0 3 ""
 
 echo -e "${CYAN}Minimize mode${NC}"
 run_test "MOF-74 [min]: 1516648" "$MOF74_CIF" 4.0 3 "--minimize"
 run_test "IRMOF [min]: IRMOF-1" "$IRMOF_CIF" 4.0 3 "--minimize"
-run_test "MIL [min]: MIL-101" "$MIL_CIF" 4.0 3 "--minimize"
+run_test "MIL [min]: MIL-100" "$MIL_CIF" 4.0 3 "--minimize"
 run_test "PCN [min]: PCN-60" "$PCN_CIF" 4.0 3 "--minimize"
 
 echo "============================================================"

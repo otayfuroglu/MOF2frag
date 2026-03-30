@@ -132,7 +132,9 @@ def extract_fragment(mof_path, center_idx=-1, radius=6.0, nmetals=3, output_path
         c0 = np.mean([supercell[m].coords for m in sbu_metals], axis=0)
         q = deque([(list(sbu_metals)[0], 0)])
         visited = set(sbu_metals)
-        struct_all_neighs = supercell.get_all_neighbors(r=3.0)
+        # Use 3.6 A here so metal-metal SBU reconstruction is consistent with
+        # topology detection; 3.0 A can miss adjacent metals in some PCNs.
+        struct_all_neighs = supercell.get_all_neighbors(r=3.6)
         
         found_sbus = []  # entries: (sbu_metals_set, path_length, center_coords)
         
@@ -168,16 +170,60 @@ def extract_fragment(mof_path, center_idx=-1, radius=6.0, nmetals=3, output_path
                 elif n_idx not in visited:
                     visited.add(n_idx)
                     q.append((n_idx, dist + 1))
+
+        # Fallback for Path C: if BFS discovery misses adjacent SBU candidates,
+        # build metal connected-components directly and pick the nearest SBU
+        # with matching metal count.
+        if not found_sbus:
+            all_metal_indices = [i for i, s in enumerate(supercell) if s.species_string in metals]
+            seen_m = set()
+            metal_components = []
+            for m in all_metal_indices:
+                if m in seen_m:
+                    continue
+                comp = {m}
+                mq = deque([m])
+                seen_m.add(m)
+                while mq:
+                    mc = mq.popleft()
+                    for mn in struct_all_neighs[mc]:
+                        if mn.species_string in metals and mn.index not in seen_m:
+                            md = np.linalg.norm(mn.coords - supercell[mc].coords)
+                            if md < 3.6:
+                                seen_m.add(mn.index)
+                                comp.add(mn.index)
+                                mq.append(mn.index)
+                metal_components.append(comp)
+
+            c_ref = np.mean([supercell[m].coords for m in sbu_metals], axis=0)
+            fallback_candidates = []
+            for comp in metal_components:
+                if len(comp) != len(sbu_metals):
+                    continue
+                c_comp = np.mean([supercell[m].coords for m in comp], axis=0)
+                if np.linalg.norm(c_comp - c_ref) < 1.0:
+                    continue
+                fallback_candidates.append((np.linalg.norm(c_comp - c_ref), comp, c_comp))
+
+            if fallback_candidates:
+                fallback_candidates.sort(key=lambda x: x[0])
+                best_dist, best_comp, best_center = fallback_candidates[0]
+                print(f"     Fallback Path C: selected nearest matching SBU at {best_dist:.2f} A")
+                found_sbus.append((best_comp, 1, best_center))
         
-        # Pick the second SBU by testing the closest candidates and minimizing the final atom count
+        # Pick the second SBU by testing multiple candidates and selecting
+        # the one that yields the smallest final fragment.
         if found_sbus:
             c1 = np.mean([supercell[m].coords for m in sbu_metals], axis=0)
             found_sbus.sort(key=lambda x: np.linalg.norm(x[2] - c1))
             
-            candidates_to_test = [found_sbus[0]]
+            max_candidates = min(20, len(found_sbus))
+            candidates_to_test = found_sbus[:max_candidates]
+            print(f"     Testing {len(candidates_to_test)} SBU candidates to minimize atom count...")
             
             best_size = float('inf')
             best_result = None
+            best_dist = float('inf')
             
             for idx, candidate in enumerate(candidates_to_test):
                 test_core = set(sbu_metals) | candidate[0]
@@ -187,9 +233,10 @@ def extract_fragment(mof_path, center_idx=-1, radius=6.0, nmetals=3, output_path
                 sz = len(sp)
                 dist_val = np.linalg.norm(candidate[2] - c1)
                 print(f"       Candidate {idx+1} (dist {dist_val:.2f} A) -> {sz} atoms")
-                if sz < best_size:
+                if sz < best_size or (sz == best_size and dist_val < best_dist):
                     best_size = sz
                     best_result = (sp, co)
+                    best_dist = dist_val
                     
             print(f"     Selected SBU candidate yielding {best_size} atoms.")
             final_species, final_coords = best_result
