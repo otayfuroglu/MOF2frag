@@ -524,7 +524,7 @@ def get_fragment(core_metals, initial_indices, supercell, sc_center_idx, metals,
             if not (is_capping_h[hi] or is_capping_h[hj]):
                 continue
             d = np.linalg.norm(np.array(coords[hi]) - np.array(coords[hj]))
-            if d < 1.55:
+            if d < 2.0:
                 if is_capping_h[hi] and not is_capping_h[hj]:
                     remove_set.add(hi)
                     break
