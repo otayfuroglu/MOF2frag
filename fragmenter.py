@@ -3,153 +3,553 @@ from pymatgen.core import Structure, Molecule
 from collections import deque
 import numpy as np
 
-def build_distance_graph(struct, max_bond=2.0):
-    all_neighbors = struct.get_all_neighbors(r=max_bond)
-    adjacency = {}
-    for i, neighs in enumerate(all_neighbors):
-        adjacency[i] = [(n.index, n.image) for n in neighs]
-    return adjacency
+METALS = {"Mg", "Zn", "Cu", "Fe", "Co", "Ni", "Mn", "Zr", "Ti", "V", "Cr"}
+LARGE_NON_METALS = {"Br", "I", "S", "P", "Cl"}
 
-def extract_fragment(mof_path, center_idx=-1, radius=6.0, output_path="fragment.xyz"):
-    if radius > 4.5:
-        print("\n===========================================================")
-        print(f"WARNING: You are using a radius of {radius} A.")
-        print("Using a radius > 4.5 A may extract disjoint or asymmetric")
-        print("linkers from adjacent pores. For a clean symmetrical cluster")
-        print("model (e.g. 3-Metal core), radius=4.0 A is recommended.")
-        print("===========================================================\n")
-        
+def is_valid_bond(s1_str, s2_str, dist):
+    if s1_str in METALS or s2_str in METALS:
+        return dist < 2.6
+    if "H" in (s1_str, s2_str):
+        return dist < 1.2
+    if s1_str in LARGE_NON_METALS or s2_str in LARGE_NON_METALS:
+        return dist < 2.2
+    return dist < 1.8
+
+def extract_fragment(mof_path, center_idx=-1, radius=6.0, nmetals=3, output_path="fragment.xyz", minimize=False):
     print(f"Loading '{mof_path}'...")
     struct = Structure.from_file(mof_path)
+    if nmetals < 1:
+        raise ValueError(f"--nmetals must be >= 1 (got {nmetals}).")
     
-    metals = {"Mg", "Zn", "Cu", "Fe", "Co", "Ni", "Mn", "Zr", "Ti", "V", "Cr"}
-    if center_idx == -1:
-        for i, site in enumerate(struct):
-            if site.species_string in metals:
-                center_idx = i
-                break
+    metals = METALS
+    user_center = center_idx != -1
+    if user_center:
+        if center_idx < 0 or center_idx >= len(struct):
+            raise IndexError(f"--center index {center_idx} is out of range [0, {len(struct)-1}]")
+        if struct[center_idx].species_string not in metals:
+            raise ValueError(
+                f"--center index {center_idx} is {struct[center_idx].species_string}, not a metal in {sorted(metals)}"
+            )
                 
-    center_site = struct[center_idx]
-    neighbors = struct.get_neighbors(center_site, radius)
-    print("Creating 3x3x3 supercell to handle periodic boundaries naturally...")
-    supercell = struct * [3, 3, 3]
+    print("Creating supercell...")
+    # Dynamically size the supercell to avoid massive memory usage on giant MOFs (MIL-100)
+    dims = [max(1, int(np.ceil(30.0 / a))) for a in struct.lattice.abc]
+    # Ensure a 3x3x3 minimum ONLY for very small cells (<15 A) to prevent self-intersection
+    dims = [max(3, d) if a < 15.0 else d for d, a in zip(dims, struct.lattice.abc)]
+    supercell = struct * dims
     
-    center_frac = [0.5, 0.5, 0.5]
-    best_dist = float('inf')
+    sc_center_cart = supercell.lattice.get_cartesian_coords([0.5, 0.5, 0.5])
+    best_dist = float("inf")
     sc_center_idx = -1
-    for i, site in enumerate(supercell):
-        if site.species_string in metals:
-            dist, _ = supercell.lattice.get_distance_and_image(center_frac, site.frac_coords)
-            if dist < best_dist:
-                best_dist = dist
+
+    if not user_center:
+        # Default behavior: auto-detect the most central metal in the supercell.
+        for i, site in enumerate(supercell):
+            if site.species_string not in metals:
+                continue
+            d = np.linalg.norm(site.coords - sc_center_cart)
+            if d < best_dist:
+                best_dist = d
                 sc_center_idx = i
-                
+    else:
+        # Explicit behavior: use the user-selected unit-cell site and pick its
+        # nearest periodic image to the supercell center.
+        target_site = struct[center_idx]
+        target_frac = np.array(target_site.frac_coords)
+        dims_arr = np.array(dims, dtype=float)
+        for i, site in enumerate(supercell):
+            if site.species_string != target_site.species_string:
+                continue
+            parent_frac = np.mod(np.array(site.frac_coords) * dims_arr, 1.0)
+            frac_delta = np.abs(np.mod(parent_frac - target_frac + 0.5, 1.0) - 0.5)
+            if np.max(frac_delta) > 1e-3:
+                continue
+            d = np.linalg.norm(site.coords - sc_center_cart)
+            if d < best_dist:
+                best_dist = d
+                sc_center_idx = i
+    
     if sc_center_idx == -1:
-        raise ValueError("No metal found in the structure to use as center!")
-        
+        if user_center:
+            raise ValueError(f"Could not map --center index {center_idx} into the generated supercell.")
+        raise ValueError("No metal found in the input structure.")
     sc_center_site = supercell[sc_center_idx]
-    print(f"Center atom is {sc_center_site.species_string} at {sc_center_site.coords}")
     
+    # 1. Topology Detection
+    print("Detecting topology...")
+    sbu_all_neighs = supercell.get_all_neighbors(r=3.6)
+    sbu_metals = {sc_center_idx}
+    sbu_queue = deque([sc_center_idx])
+    is_infinite_sbu = False
+    while sbu_queue:
+        curr = sbu_queue.popleft()
+        for n in sbu_all_neighs[curr]:
+            if n.species_string in metals and n.index not in sbu_metals:
+                sbu_metals.add(n.index)
+                sbu_queue.append(n.index)
+        if len(sbu_metals) > 20:
+            is_infinite_sbu = True
+            break
+            
+    if not is_infinite_sbu and len(sbu_metals) > 1:
+        coords = np.array([supercell[i].coords for i in sbu_metals])
+        dists = np.sqrt(((coords[:, None, :] - coords[None, :, :])**2).sum(axis=-1))
+        if dists.max() > min(struct.lattice.abc) * 0.5:
+            is_infinite_sbu = True
+
+    # 2. Seeding & Core Selection
+    # The 'Old Version' behavior for Path B: take all atoms in radius.
     sc_neighbors = supercell.get_neighbors(sc_center_site, radius)
-    initial_indices = {n.index for n in sc_neighbors}
-    initial_indices.add(sc_center_idx)
+    initial_indices = {sc_center_idx}
+    for n in sc_neighbors:
+        if not is_infinite_sbu:
+            initial_indices.add(n.index)
+        else:
+            # For Path B, only add non-metals from the spatial cut
+            if n.species_string not in metals:
+                initial_indices.add(n.index)
     
-    print("Building bond graph for supercell...")
-    sc_all_neighbors = supercell.get_all_neighbors(r=3.0) 
-    
+    if is_infinite_sbu:
+        # Path B: Select exactly nmetals closest to center
+        print(f"  -> Path B (Infinite). Metals: {nmetals}")
+        all_sc_m = []
+        for i, site in enumerate(supercell):
+            if site.species_string in metals:
+                all_sc_m.append((np.linalg.norm(site.coords - sc_center_site.coords), i))
+        all_sc_m.sort()
+        core_metals = {idx for _, idx in all_sc_m[:nmetals]}
+        if len(core_metals) < nmetals:
+            raise ValueError(
+                f"Requested --nmetals={nmetals}, but only found {len(core_metals)} metals in generated supercell."
+            )
+        # Ensure our selected nmetals are in the initial set
+        initial_indices.update(core_metals)
+        is_path_c = False
+    elif len(sbu_metals) == 2 and not minimize:
+        # Path C: Paddlewheel / Small SBU -> extract 2 SBUs to get the full linker between them
+        print(f"  -> Path C (Discrete, 2 SBUs). Auto-detected small SBU size: {len(sbu_metals)}")
+        
+        c0 = np.mean([supercell[m].coords for m in sbu_metals], axis=0)
+        q = deque([(list(sbu_metals)[0], 0)])
+        visited = set(sbu_metals)
+        struct_all_neighs = supercell.get_all_neighbors(r=3.0)
+        
+        found_sbus = []  # entries: (sbu_metals_set, path_length, center_coords)
+        
+        while q:  # completely explore local organic connected components
+            curr_idx, dist = q.popleft()
+            curr_site = supercell[curr_idx]
+            
+            for n in struct_all_neighs[curr_idx]:
+                n_idx = n.index
+                n_dist = np.linalg.norm(n.coords - curr_site.coords)
+                if not is_valid_bond(n.species_string, curr_site.species_string, n_dist):
+                    continue
+                
+                if n.species_string in metals and n_idx not in sbu_metals:
+                    m_comp = {n_idx}
+                    mq = deque([n_idx])
+                    mv = {n_idx}
+                    while mq:
+                        mc = mq.popleft()
+                        for mn in struct_all_neighs[mc]:
+                            if mn.species_string in metals and mn.index not in mv:
+                                md = np.linalg.norm(mn.coords - supercell[mc].coords)
+                                if md < 3.6:
+                                    mv.add(mn.index)
+                                    m_comp.add(mn.index)
+                                    mq.append(mn.index)
+                    if len(m_comp) == len(sbu_metals):
+                        c1 = np.mean([supercell[m].coords for m in m_comp], axis=0)
+                        # ensure not already found
+                        if not any(np.linalg.norm(x[2] - c1) < 1.0 for x in found_sbus):
+                            found_sbus.append((m_comp, dist + 1, c1))
+                            
+                elif n_idx not in visited:
+                    visited.add(n_idx)
+                    q.append((n_idx, dist + 1))
+        
+        # Pick the second SBU by testing the closest candidates and minimizing the final atom count
+        if found_sbus:
+            c1 = np.mean([supercell[m].coords for m in sbu_metals], axis=0)
+            found_sbus.sort(key=lambda x: np.linalg.norm(x[2] - c1))
+            
+            candidates_to_test = [found_sbus[0]]
+            
+            best_size = float('inf')
+            best_result = None
+            
+            for idx, candidate in enumerate(candidates_to_test):
+                test_core = set(sbu_metals) | candidate[0]
+                test_init = set(initial_indices) | test_core
+                sp, co = get_fragment(test_core, test_init, supercell, sc_center_idx, metals, is_infinite_sbu, nmetals, minimize)
+                
+                sz = len(sp)
+                dist_val = np.linalg.norm(candidate[2] - c1)
+                print(f"       Candidate {idx+1} (dist {dist_val:.2f} A) -> {sz} atoms")
+                if sz < best_size:
+                    best_size = sz
+                    best_result = (sp, co)
+                    
+            print(f"     Selected SBU candidate yielding {best_size} atoms.")
+            final_species, final_coords = best_result
+        else:
+            print("     Could not find adjacent SBU. Reverting to 1 SBU.")
+            core_metals = set(sbu_metals)
+            initial_indices.update(core_metals)
+            final_species, final_coords = get_fragment(core_metals, initial_indices, supercell, sc_center_idx, metals, is_infinite_sbu, nmetals, minimize)
+            
+        is_path_c = True
+        
+    else:
+        # Path A: Discrete SBU
+        print(f"  -> Path A (Discrete). SBU size: {len(sbu_metals)}")
+        core_metals = sbu_metals
+        initial_indices.update(core_metals)
+        is_path_c = False
+
+    if not is_path_c:
+        final_species, final_coords = get_fragment(core_metals, initial_indices, supercell, sc_center_idx, metals, is_infinite_sbu, nmetals, minimize)
+
+    print(f"Final size: {len(final_species)} atoms.")
+    mol = Molecule(final_species, final_coords)
+    mol.to(filename=output_path, fmt="xyz")
+
+
+def get_fragment(core_metals, initial_indices, supercell, sc_center_idx, metals, is_infinite_sbu, nmetals, minimize):
+    # 3. Traversal
+    sc_all_neighbors = supercell.get_all_neighbors(r=3.0)
     final_indices = set(initial_indices)
     queue = deque(initial_indices)
     visited = set(initial_indices)
-    
     broken_bonds = []
+    
+    unwrapped_coords = {idx: supercell[idx].coords for idx in initial_indices}
     
     while queue:
         curr_idx = queue.popleft()
         curr_site = supercell[curr_idx]
         
-        if curr_site.species_string in metals and curr_idx != sc_center_idx:
-            continue
+        # Path B Traversal Limit: only traverse outward from absolute center
+        if is_infinite_sbu and curr_site.species_string in metals:
+            if curr_idx != sc_center_idx:
+                continue
+        # Path A / Path C Traversal Limit: only traverse outward from SBU metals
+        if not is_infinite_sbu and curr_site.species_string in metals:
+            if curr_idx not in core_metals:
+                continue
             
         for n in sc_all_neighbors[curr_idx]:
             n_idx = n.index
-            n_species = n.species_string
-            n_dist = getattr(n, 'nn_distance', supercell.lattice.get_distance_and_image(curr_site.frac_coords, n.frac_coords)[0])
+            n_dist = np.linalg.norm(n.coords - curr_site.coords)
             
-            is_valid_bond = False
-            if n_species in metals and n_dist < 2.6:
-                is_valid_bond = True
-            elif n_species not in metals and n_dist < 1.8:
-                is_valid_bond = True
-                
-            if not is_valid_bond:
-                continue
+            is_bond = is_valid_bond(n.species_string, curr_site.species_string, n_dist)
+            if not is_bond: continue
             
-            if n_species in metals and n_idx not in initial_indices:
-                broken_bonds.append((curr_idx, n))
+            if n.species_string in metals:
+                if n_idx not in core_metals:
+                    unwrapped_nb_pos = unwrapped_coords[curr_idx] + (n.coords - curr_site.coords)
+                    broken_bonds.append((curr_idx, unwrapped_nb_pos))
+                elif n_idx not in visited:
+                    final_indices.add(n_idx); visited.add(n_idx); queue.append(n_idx)
+                    unwrapped_coords[n_idx] = unwrapped_coords[curr_idx] + (n.coords - curr_site.coords)
             elif n_idx not in visited:
-                final_indices.add(n_idx)
-                visited.add(n_idx)
-                queue.append(n_idx)
+                final_indices.add(n_idx); visited.add(n_idx); queue.append(n_idx)
+                unwrapped_coords[n_idx] = unwrapped_coords[curr_idx] + (n.coords - curr_site.coords)
 
-    print(f"Extracted {len(final_indices)} raw atoms from MOF.")
+    # 3.5 Coordination Completion for Edge Metals (Path B only)
+    # The main BFS only traverses from center metal, so edge metals
+    # miss linkers on their far side. Do a FULL BFS from each edge
+    # metal, stopping only at external metal boundaries.
+    if is_infinite_sbu and nmetals > 1:
+        print("Completing coordination for edge metals...")
+        edge_metals = core_metals - {sc_center_idx}
+        comp_queue = deque(edge_metals)
+        
+        while comp_queue:
+            idx = comp_queue.popleft()
+            site = supercell[idx]
+            
+            # Don't traverse outward from metals that aren't in our core
+            if site.species_string in metals and idx not in core_metals:
+                continue
+                
+            for n in sc_all_neighbors[idx]:
+                n_idx = n.index
+                n_dist = np.linalg.norm(n.coords - site.coords)
+                
+                is_bond = is_valid_bond(n.species_string, site.species_string, n_dist)
+                if not is_bond: continue
+                
+                if n.species_string in metals:
+                    if n_idx not in core_metals:
+                        unwrapped_nb_pos = unwrapped_coords[idx] + (n.coords - site.coords)
+                        broken_bonds.append((idx, unwrapped_nb_pos))
+                elif n_idx not in visited:
+                    final_indices.add(n_idx)
+                    visited.add(n_idx)
+                    comp_queue.append(n_idx)
+                    unwrapped_coords[n_idx] = unwrapped_coords[idx] + (n.coords - site.coords)
+
+    # 3.6 Prune Partial Linkers
+    # A "complete" linker bridges 2+ core metals. A "partial" linker only
+    # touches 1 core metal (dangling chain). Remove partial linkers and
+    # cap the metal with H.
+    print("Pruning partial linkers...")
     
-    sites = [supercell[idx] for idx in final_indices]
+    # Build local bond adjacency among final_indices
+    organic_indices = {idx for idx in final_indices if supercell[idx].species_string not in metals}
+    local_adj = {idx: [] for idx in final_indices}
+    for idx in final_indices:
+        s1 = supercell[idx]
+        for n in sc_all_neighbors[idx]:
+            if n.index in final_indices:
+                nd = np.linalg.norm(n.coords - s1.coords)
+                is_b = is_valid_bond(s1.species_string, n.species_string, nd)
+                if is_b:
+                    local_adj[idx].append(n.index)
+    
+    # Find organic connected components (BFS ignoring metal nodes)
+    org_visited = set()
+    components = []
+    for seed in organic_indices:
+        if seed in org_visited: continue
+        component = set([seed])
+        org_visited.add(seed)
+        q = deque([seed])
+        while q:
+            cur = q.popleft()
+            for nb in local_adj[cur]:
+                if nb not in org_visited and supercell[nb].species_string not in metals:
+                    org_visited.add(nb)
+                    component.add(nb)
+                    q.append(nb)
+        if component:
+            components.append(component)
+    
+    # For each component, count how many distinct core metals it touches
+    if minimize:
+        # ==========================================
+        # ADVANCED MINIMIZED PRUNING
+        # ==========================================
+        linker_evaluations = []
+        kept_any_full_linker = False
+        
+        for comp in components:
+            touching_metals = set()
+            bridge_atoms = set()
+            for atom_idx in comp:
+                for nb in local_adj[atom_idx]:
+                    if nb in core_metals:
+                        touching_metals.add(nb)
+                        bridge_atoms.add(atom_idx)
+                        
+            keep_linker = False
+            if len(touching_metals) >= 2:
+                touched_coords = [supercell[m].coords for m in touching_metals]
+                max_dist = 0
+                for i in range(len(touched_coords)):
+                    for j in range(i+1, len(touched_coords)):
+                        d = np.linalg.norm(touched_coords[i] - touched_coords[j])
+                        if d > max_dist: max_dist = d
+                if max_dist > 4.5:
+                    keep_linker = True
+                    
+            if keep_linker:
+                kept_any_full_linker = True
+                
+            linker_evaluations.append((comp, bridge_atoms, keep_linker))
+            
+        if not kept_any_full_linker and linker_evaluations:
+            linker_evaluations.sort(key=lambda x: len(x[0]), reverse=True)
+            best_comp, best_ba, _ = linker_evaluations[0]
+            linker_evaluations[0] = (best_comp, best_ba, True)
+            
+        partial_to_remove = set()
+        bridge_atoms_to_cap = []
+        
+        for comp, bridge_atoms, keep_linker in linker_evaluations:
+            if not keep_linker:
+                keep_atoms = set(bridge_atoms)
+                q = deque([(ba, 0) for ba in bridge_atoms])
+                while q:
+                    curr, depth = q.popleft()
+                    if depth < 5:
+                        for nb in local_adj[curr]:
+                            if nb in comp and nb not in keep_atoms:
+                                keep_atoms.add(nb)
+                                q.append((nb, depth + 1))
+                
+                # Trim dangling boundary atoms: if a kept C atom has only 1 
+                # neighbor inside keep_atoms, it's a stub from a fused ring 
+                # (e.g. naphthalene junction C). Remove it iteratively.
+                changed = True
+                while changed:
+                    changed = False
+                    to_remove = set()
+                    for ka in keep_atoms - bridge_atoms:
+                        if supercell[ka].species_string == "C":
+                            internal_bonds = sum(1 for nb in local_adj[ka] if nb in keep_atoms)
+                            if internal_bonds <= 1:
+                                to_remove.add(ka)
+                    if to_remove:
+                        keep_atoms -= to_remove
+                        changed = True
+                                
+                atoms_to_cut = comp - keep_atoms
+                partial_to_remove.update(atoms_to_cut)
+                
+                for ka in keep_atoms:
+                    removed_neighbor_coords = []
+                    for nb in local_adj[ka]:
+                        if nb in atoms_to_cut:
+                            removed_neighbor_coords.append(unwrapped_coords[nb])
+                    if removed_neighbor_coords:
+                        bridge_atoms_to_cap.append((ka, removed_neighbor_coords))
+    else:
+        # ==========================================
+        # NORMAL/ORIGINAL PRUNING
+        # ==========================================
+        partial_to_remove = set()
+        bridge_atoms_to_cap = []
+        for comp in components:
+            touching_metals = set()
+            bridge_atoms = set()
+            for atom_idx in comp:
+                for nb in local_adj[atom_idx]:
+                    if nb in core_metals:
+                        touching_metals.add(nb)
+                        bridge_atoms.add(atom_idx)
+            if len(touching_metals) < 2:
+                atoms_to_cut = comp - bridge_atoms
+                partial_to_remove.update(atoms_to_cut)
+                for ba in bridge_atoms:
+                    removed_neighbor_coords = []
+                    for nb in local_adj[ba]:
+                        if nb in atoms_to_cut:
+                            removed_neighbor_coords.append(unwrapped_coords[nb])
+                    if removed_neighbor_coords:
+                        bridge_atoms_to_cap.append((ba, removed_neighbor_coords))
+    
+    if partial_to_remove:
+        final_indices -= partial_to_remove
+        broken_bonds = [(l, n) for l, n in broken_bonds if l not in partial_to_remove]
+
+    # 4. Capping & Save
+    ordered_indices = sorted(final_indices)
+    sites = [supercell[idx] for idx in ordered_indices]
     species = [s.species_string for s in sites]
-    coords = [s.coords for s in sites]
+    coords = [unwrapped_coords[idx] for idx in ordered_indices]
+    # Track metadata only for H atoms we add during capping.
+    h_parent = [None] * len(species)
+    is_capping_h = [False] * len(species)
     
     bonds_by_ligand = {}
-    for ligand_idx, missing_metal in broken_bonds:
-        if ligand_idx not in bonds_by_ligand:
-            bonds_by_ligand[ligand_idx] = []
-        bonds_by_ligand[ligand_idx].append(missing_metal.coords)
+    for lid, unwrapped_m_pos in broken_bonds:
+        if lid not in bonds_by_ligand: bonds_by_ligand[lid] = []
+        bonds_by_ligand[lid].append(unwrapped_m_pos)
+    
+    def cap_bond_length(site_species):
+        if site_species == "C":
+            return 1.09
+        if site_species == "N":
+            return 1.01
+        return 0.96
+
+    for ba_idx, removed_coords in bridge_atoms_to_cap:
+        ba_site = supercell[ba_idx]
+        ba_pos = unwrapped_coords[ba_idx]
+        bl = cap_bond_length(ba_site.species_string)
+        # Add one H per severed bond direction to avoid vector-cancellation
+        # artifacts that can miss required capping on carbons in --minimize mode.
+        for rc in removed_coords:
+            vec = rc - ba_pos
+            d = np.linalg.norm(vec)
+            if d > 0:
+                species.append("H")
+                coords.append(ba_pos + (vec / d) * bl)
+                h_parent.append(ba_idx)
+                is_capping_h.append(True)
+    
+    already_capped = {ba_idx for ba_idx, _ in bridge_atoms_to_cap}
         
-    capped_count = 0
-    for ligand_idx, missing_coords in bonds_by_ligand.items():
-        ligand_site = supercell[ligand_idx]
-        
-        kept_bonds = 0
-        for n in sc_all_neighbors[ligand_idx]:
+    for lid, missing_coords in bonds_by_ligand.items():
+        if lid in already_capped: continue
+        lsite = supercell[lid]
+        lpos = unwrapped_coords[lid]
+        kept = 0
+        for n in sc_all_neighbors[lid]:
             if n.index in final_indices:
-                n_species2 = n.species_string
-                n_dist2 = getattr(n, 'nn_distance', supercell.lattice.get_distance_and_image(ligand_site.frac_coords, n.frac_coords)[0])
-                if n_species2 in metals and n_dist2 < 2.6:
-                    kept_bonds += 1
-                elif n_species2 not in metals and n_dist2 < 1.8:
-                    kept_bonds += 1
-                    
-        if ligand_site.species_string == "O" and kept_bonds >= 2:
-            continue
-            
-        capped_count += 1
+                d = np.linalg.norm(n.coords - lsite.coords)
+                if is_valid_bond(n.species_string, lsite.species_string, d):
+                    kept = kept + 1
+        if lsite.species_string == "O" and kept >= 2: continue
         avg_vec = np.zeros(3)
-        for coords_ in missing_coords:
-            avg_vec += (coords_ - ligand_site.coords)
-            
+        for c in missing_coords:
+            avg_vec = avg_vec + (c - lpos)
         dist = np.linalg.norm(avg_vec)
         if dist > 0:
             unit_vec = avg_vec / dist
-            bond_length = 0.96
-            if ligand_site.species_string == "C": bond_length = 1.09
-            elif ligand_site.species_string == "N": bond_length = 1.01
-            
-            h_coords = ligand_site.coords + unit_vec * bond_length
+            bl = cap_bond_length(lsite.species_string)
             species.append("H")
-            coords.append(h_coords)
-            
-    print(f"Capped {capped_count} exposed atoms with 1 Hydrogen each...")
-    print(f"Final fragment size: {len(species)} atoms.")
-    mol = Molecule(species, coords)
+            coords.append(lpos + unit_vec * bl)
+            h_parent.append(lid)
+            is_capping_h.append(True)
     
-    print(f"Saving fragment to {output_path}...")
-    mol.to(filename=output_path, fmt="xyz")
-    print("Done!")
+    # Resolve close H-H contacts where at least one atom is a capping hydrogen.
+    # Prefer keeping native H when it clashes with capping H, and otherwise keep
+    # the capping H with better clearance from other heavy atoms.
+    h_indices = [i for i, s in enumerate(species) if s == "H"]
+    heavy_indices = [i for i, s in enumerate(species) if s != "H"]
+
+    def clearance_score(h_idx):
+        hp = h_parent[h_idx]
+        best = float("inf")
+        hpos = np.array(coords[h_idx])
+        for k in heavy_indices:
+            if k == hp:
+                continue
+            d = np.linalg.norm(hpos - np.array(coords[k]))
+            if d < best:
+                best = d
+        return best
+
+    remove_set = set()
+    for i in range(len(h_indices)):
+        if h_indices[i] in remove_set: continue
+        for j in range(i + 1, len(h_indices)):
+            if h_indices[j] in remove_set: continue
+            hi = h_indices[i]
+            hj = h_indices[j]
+            if not (is_capping_h[hi] or is_capping_h[hj]):
+                continue
+            d = np.linalg.norm(np.array(coords[hi]) - np.array(coords[hj]))
+            if d < 1.55:
+                if is_capping_h[hi] and not is_capping_h[hj]:
+                    remove_set.add(hi)
+                    break
+                if is_capping_h[hj] and not is_capping_h[hi]:
+                    remove_set.add(hj)
+                    continue
+                si = clearance_score(hi)
+                sj = clearance_score(hj)
+                if si < sj:
+                    remove_set.add(hi)
+                    break
+                remove_set.add(hj)
+    if remove_set:
+        species = [s for i, s in enumerate(species) if i not in remove_set]
+        coords = [c for i, c in enumerate(coords) if i not in remove_set]
+            
+    return species, coords
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Extract MOF fragment.")
-    parser.add_argument("cif_path", help="Path to the MOF CIF file.")
-    parser.add_argument("--center", type=int, default=-1, help="Index of the center metal atom (-1 to auto-detect).")
-    parser.add_argument("--radius", type=float, default=6.0, help="Initial extraction radius in Angstroms.")
-    parser.add_argument("--output", default="extracted_fragment.xyz", help="Output file path.")
-    
+    parser = argparse.ArgumentParser()
+    parser.add_argument("cif_path")
+    parser.add_argument("--center", type=int, default=-1)
+    parser.add_argument("--radius", type=float, default=6.0)
+    parser.add_argument("--nmetals", type=int, default=3)
+    parser.add_argument("--output", default="extracted_fragment.xyz")
+    parser.add_argument("--minimize", action="store_true", help="Enable advanced structure minimization by restricting partials cleanly")
     args = parser.parse_args()
-    extract_fragment(args.cif_path, args.center, args.radius, args.output)
+    extract_fragment(args.cif_path, args.center, args.radius, args.nmetals, args.output, args.minimize)
