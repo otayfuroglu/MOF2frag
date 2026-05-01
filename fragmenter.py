@@ -3,7 +3,7 @@ from pymatgen.core import Structure, Molecule
 from collections import deque
 import numpy as np
 
-METALS = {"Mg", "Zn", "Cu", "Fe", "Co", "Ni", "Mn", "Zr", "Ti", "V", "Cr"}
+METALS = {"Mg", "Zn", "Cu", "Fe", "Co", "Ni", "Mn", "Zr", "Ti", "V", "Cr", "Al"}
 LARGE_NON_METALS = {"Br", "I", "S", "P", "Cl"}
 
 def is_valid_bond(s1_str, s2_str, dist):
@@ -111,7 +111,11 @@ def extract_fragment(mof_path, center_idx=-1, radius=6.0, nmetals=3, output_path
     sc_neighbors = supercell.get_neighbors(sc_center_site, radius)
     initial_indices = {sc_center_idx}
     for n in sc_neighbors:
-        if not is_infinite_sbu:
+        if zif_mode:
+            # Path D: keep single-metal core and organic neighborhood only.
+            if n.species_string not in metals:
+                initial_indices.add(n.index)
+        elif not is_infinite_sbu:
             initial_indices.add(n.index)
         else:
             # For Path B, only add non-metals from the spatial cut
@@ -278,9 +282,15 @@ def extract_fragment(mof_path, center_idx=-1, radius=6.0, nmetals=3, output_path
 def get_fragment(core_metals, initial_indices, supercell, sc_center_idx, metals, is_infinite_sbu, nmetals, minimize, zif_mode=False):
     # 3. Traversal
     sc_all_neighbors = supercell.get_all_neighbors(r=3.0)
-    final_indices = set(initial_indices)
-    queue = deque(initial_indices)
-    visited = set(initial_indices)
+    # Drop non-core metals from the initial seed to avoid isolated far metals.
+    seeded = set()
+    for idx in initial_indices:
+        if supercell[idx].species_string in metals and idx not in core_metals:
+            continue
+        seeded.add(idx)
+    final_indices = set(seeded)
+    queue = deque(seeded)
+    visited = set(seeded)
     broken_bonds = []
     
     unwrapped_coords = {idx: supercell[idx].coords for idx in initial_indices}
@@ -505,6 +515,46 @@ def get_fragment(core_metals, initial_indices, supercell, sc_center_idx, metals,
         final_indices -= partial_to_remove
         broken_bonds = [(l, n) for l, n in broken_bonds if l not in partial_to_remove]
 
+    # Remove disconnected heavy components not anchored to the main core.
+    heavy_indices = [idx for idx in final_indices if supercell[idx].species_string != "H"]
+    if heavy_indices:
+        heavy_adj = {idx: [] for idx in heavy_indices}
+        heavy_set = set(heavy_indices)
+        for idx in heavy_indices:
+            s1 = supercell[idx]
+            for n in sc_all_neighbors[idx]:
+                if n.index in heavy_set:
+                    nd = np.linalg.norm(n.coords - s1.coords)
+                    if is_valid_bond(s1.species_string, n.species_string, nd):
+                        heavy_adj[idx].append(n.index)
+
+        comps = []
+        vis = set()
+        for idx in heavy_indices:
+            if idx in vis:
+                continue
+            q = deque([idx])
+            vis.add(idx)
+            comp = set([idx])
+            while q:
+                cur = q.popleft()
+                for nb in heavy_adj[cur]:
+                    if nb not in vis:
+                        vis.add(nb)
+                        comp.add(nb)
+                        q.append(nb)
+            comps.append(comp)
+
+        if len(comps) > 1:
+            def comp_key(comp):
+                core_count = sum(1 for i in comp if i in core_metals)
+                metal_count = sum(1 for i in comp if supercell[i].species_string in metals)
+                return (core_count, metal_count, len(comp))
+
+            best_comp = max(comps, key=comp_key)
+            final_indices = {idx for idx in final_indices if (idx in best_comp) or (supercell[idx].species_string == "H")}
+            broken_bonds = [(l, n) for l, n in broken_bonds if l in final_indices]
+
     # 4. Capping & Save
     ordered_indices = sorted(final_indices)
     sites = [supercell[idx] for idx in ordered_indices]
@@ -551,7 +601,7 @@ def get_fragment(core_metals, initial_indices, supercell, sc_center_idx, metals,
                     min_heavy = d
         return min_h, min_heavy
 
-    def place_capping_h(parent_idx, base_vec, bl, min_hh=1.5, min_heavy=0.9):
+    def place_capping_h(parent_idx, base_vec, bl, min_hh=1.5, min_heavy=0.9, min_o_contact=1.5):
         parent_pos = np.array(coords[parent_idx])
         vnorm = np.linalg.norm(base_vec)
         if vnorm < 1e-12:
@@ -573,26 +623,48 @@ def get_fragment(core_metals, initial_indices, supercell, sc_center_idx, metals,
                     dir_vec = ct * u + st * (np.cos(ph_r) * e1 + np.sin(ph_r) * e2)
                     directions.append(dir_vec / np.linalg.norm(dir_vec))
 
-        best_pos = None
-        best_tuple = (-1.0, -1.0)
+        parent_species = species[parent_idx]
         for dvec in directions:
             cand = parent_pos + dvec * bl
+            # Keep any newly placed H out of non-bonded O...H contact range.
+            # If the parent is oxygen, allow proximity only to that parent O.
+            too_close_to_o = False
+            for oi, os in enumerate(species):
+                if os != "O":
+                    continue
+                if parent_species == "O" and oi == parent_idx:
+                    continue
+                if np.linalg.norm(cand - np.array(coords[oi])) < min_o_contact:
+                    too_close_to_o = True
+                    break
+            if too_close_to_o:
+                continue
             mh, mheavy = _score_candidate_h(cand, parent_idx)
             if mh >= min_hh and mheavy >= min_heavy:
                 species.append("H")
                 coords.append(cand)
                 return
-            rank = (mh, mheavy)
-            if rank > best_tuple:
-                best_tuple = rank
-                best_pos = cand
+        # No valid placement found: skip capping rather than creating
+        # geometrically invalid close contacts.
 
-        # Fallback: place best available direction rather than dropping H.
-        if best_pos is not None:
-            species.append("H")
-            coords.append(best_pos)
+    def oxygen_already_protonated(parent_idx, oh_cutoff=1.5):
+        if species[parent_idx] != "O":
+            return False
+        opos = np.array(coords[parent_idx])
+        for i, s in enumerate(species):
+            if s != "H":
+                continue
+            if np.linalg.norm(opos - np.array(coords[i])) <= oh_cutoff:
+                return True
+        return False
 
+    # Merge capping requests per bridge atom to avoid duplicate H placement
+    # on the same anchor (especially O atoms).
+    bridge_cap_map = {}
     for ba_idx, removed_coords in bridge_atoms_to_cap:
+        bridge_cap_map.setdefault(ba_idx, []).extend(removed_coords)
+
+    for ba_idx, removed_coords in bridge_cap_map.items():
         ba_site = supercell[ba_idx]
         ba_pos = np.array(unwrapped_coords[ba_idx])
         bl = cap_bond_length(ba_site.species_string)
@@ -600,9 +672,19 @@ def get_fragment(core_metals, initial_indices, supercell, sc_center_idx, metals,
         if parent_local_idx is None:
             # Parent atom may not be in ordered_indices if pruned unexpectedly.
             continue
-        for rc in removed_coords:
-            vec = rc - ba_pos
-            place_capping_h(parent_local_idx, vec, bl, min_hh=1.5)
+
+        if ba_site.species_string == "O":
+            if oxygen_already_protonated(parent_local_idx):
+                continue
+            # Oxygen anchors should receive at most one capping H.
+            avg_vec = np.zeros(3)
+            for rc in removed_coords:
+                avg_vec = avg_vec + (rc - ba_pos)
+            place_capping_h(parent_local_idx, avg_vec, bl, min_hh=1.5)
+        else:
+            for rc in removed_coords:
+                vec = rc - ba_pos
+                place_capping_h(parent_local_idx, vec, bl, min_hh=1.5)
     
     already_capped = {ba_idx for ba_idx, _ in bridge_atoms_to_cap}
         
@@ -625,7 +707,61 @@ def get_fragment(core_metals, initial_indices, supercell, sc_center_idx, metals,
             bl = cap_bond_length(lsite.species_string)
             parent_local_idx = local_index.get(lid)
             if parent_local_idx is not None:
+                if species[parent_local_idx] == "O" and oxygen_already_protonated(parent_local_idx):
+                    continue
                 place_capping_h(parent_local_idx, avg_vec, bl, min_hh=1.5)
+
+    # Final geometry-space cleanup: for non-minimize modes, drop detached
+    # heavy-atom fragments (e.g. isolated remote metal clusters) and retain
+    # only the principal component, plus its bonded hydrogens.
+    if not minimize:
+        heavy_idx = [i for i, s in enumerate(species) if s != "H"]
+        if heavy_idx:
+            heavy_adj = {i: [] for i in heavy_idx}
+            for a in range(len(heavy_idx)):
+                i = heavy_idx[a]
+                ci = np.array(coords[i])
+                for b in range(a + 1, len(heavy_idx)):
+                    j = heavy_idx[b]
+                    d = np.linalg.norm(ci - np.array(coords[j]))
+                    if is_valid_bond(species[i], species[j], d):
+                        heavy_adj[i].append(j)
+                        heavy_adj[j].append(i)
+
+            comps = []
+            vis = set()
+            for i in heavy_idx:
+                if i in vis:
+                    continue
+                q = deque([i])
+                vis.add(i)
+                comp = set([i])
+                while q:
+                    cur = q.popleft()
+                    for nb in heavy_adj[cur]:
+                        if nb not in vis:
+                            vis.add(nb)
+                            comp.add(nb)
+                            q.append(nb)
+                comps.append(comp)
+
+            if len(comps) > 1:
+                def comp_key(comp):
+                    m = sum(1 for i in comp if species[i] in metals)
+                    return (m, len(comp))
+                keep_heavy = max(comps, key=comp_key)
+                keep = set(keep_heavy)
+                for i, s in enumerate(species):
+                    if s != "H":
+                        continue
+                    ci = np.array(coords[i])
+                    for j in keep_heavy:
+                        d = np.linalg.norm(ci - np.array(coords[j]))
+                        if is_valid_bond("H", species[j], d):
+                            keep.add(i)
+                            break
+                species = [s for i, s in enumerate(species) if i in keep]
+                coords = [c for i, c in enumerate(coords) if i in keep]
             
     return species, coords
 
