@@ -97,6 +97,15 @@ def extract_fragment(mof_path, center_idx=-1, radius=6.0, nmetals=3, output_path
         if dists.max() > min(struct.lattice.abc) * 0.5:
             is_infinite_sbu = True
 
+    # ZIF-like auto-detection (Path D):
+    # single-metal node with N-rich first coordination shell.
+    zif_mode = False
+    if not is_infinite_sbu and len(sbu_metals) == 1:
+        first_shell = supercell.get_neighbors(sc_center_site, 2.3)
+        n_neighbors = sum(1 for n in first_shell if n.species_string == "N")
+        if n_neighbors >= 3:
+            zif_mode = True
+
     # 2. Seeding & Core Selection
     # The 'Old Version' behavior for Path B: take all atoms in radius.
     sc_neighbors = supercell.get_neighbors(sc_center_site, radius)
@@ -228,7 +237,7 @@ def extract_fragment(mof_path, center_idx=-1, radius=6.0, nmetals=3, output_path
             for idx, candidate in enumerate(candidates_to_test):
                 test_core = set(sbu_metals) | candidate[0]
                 test_init = set(initial_indices) | test_core
-                sp, co = get_fragment(test_core, test_init, supercell, sc_center_idx, metals, is_infinite_sbu, nmetals, minimize)
+                sp, co = get_fragment(test_core, test_init, supercell, sc_center_idx, metals, is_infinite_sbu, nmetals, minimize, zif_mode)
                 
                 sz = len(sp)
                 dist_val = np.linalg.norm(candidate[2] - c1)
@@ -244,26 +253,29 @@ def extract_fragment(mof_path, center_idx=-1, radius=6.0, nmetals=3, output_path
             print("     Could not find adjacent SBU. Reverting to 1 SBU.")
             core_metals = set(sbu_metals)
             initial_indices.update(core_metals)
-            final_species, final_coords = get_fragment(core_metals, initial_indices, supercell, sc_center_idx, metals, is_infinite_sbu, nmetals, minimize)
+            final_species, final_coords = get_fragment(core_metals, initial_indices, supercell, sc_center_idx, metals, is_infinite_sbu, nmetals, minimize, zif_mode)
             
         is_path_c = True
         
     else:
-        # Path A: Discrete SBU
-        print(f"  -> Path A (Discrete). SBU size: {len(sbu_metals)}")
+        # Path A / Path D: Discrete SBU
+        if zif_mode:
+            print(f"  -> Path D (ZIF-like). SBU size: {len(sbu_metals)}")
+        else:
+            print(f"  -> Path A (Discrete). SBU size: {len(sbu_metals)}")
         core_metals = sbu_metals
         initial_indices.update(core_metals)
         is_path_c = False
 
     if not is_path_c:
-        final_species, final_coords = get_fragment(core_metals, initial_indices, supercell, sc_center_idx, metals, is_infinite_sbu, nmetals, minimize)
+        final_species, final_coords = get_fragment(core_metals, initial_indices, supercell, sc_center_idx, metals, is_infinite_sbu, nmetals, minimize, zif_mode)
 
     print(f"Final size: {len(final_species)} atoms.")
     mol = Molecule(final_species, final_coords)
     mol.to(filename=output_path, fmt="xyz")
 
 
-def get_fragment(core_metals, initial_indices, supercell, sc_center_idx, metals, is_infinite_sbu, nmetals, minimize):
+def get_fragment(core_metals, initial_indices, supercell, sc_center_idx, metals, is_infinite_sbu, nmetals, minimize, zif_mode=False):
     # 3. Traversal
     sc_all_neighbors = supercell.get_all_neighbors(r=3.0)
     final_indices = set(initial_indices)
@@ -392,10 +404,9 @@ def get_fragment(core_metals, initial_indices, supercell, sc_center_idx, metals,
                         touching_metals.add(nb)
                         bridge_atoms.add(atom_idx)
 
-            # Strict dangling-linker removal:
-            # if a component touches <2 distinct core metals, keep only the
-            # first-shell bridge atoms (typically O) and cap them.
-            if len(touching_metals) < 2:
+            # Path D keeps one-metal-attached imidazolate linkers.
+            remove_cond = len(touching_metals) < 1 if zif_mode else len(touching_metals) < 2
+            if remove_cond:
                 atoms_to_cut = comp - bridge_atoms
                 partial_to_remove.update(atoms_to_cut)
                 for ba in bridge_atoms:
@@ -477,9 +488,9 @@ def get_fragment(core_metals, initial_indices, supercell, sc_center_idx, metals,
                     if nb in core_metals:
                         touching_metals.add(nb)
                         bridge_atoms.add(atom_idx)
-            # Eliminate components connected to only one (or zero) core metals.
-            # Keep first-shell bridge atoms and cap them.
-            if len(touching_metals) < 2:
+            # Path D keeps one-metal-attached imidazolate linkers.
+            remove_cond = len(touching_metals) < 1 if zif_mode else len(touching_metals) < 2
+            if remove_cond:
                 atoms_to_cut = comp - bridge_atoms
                 partial_to_remove.update(atoms_to_cut)
                 for ba in bridge_atoms:
