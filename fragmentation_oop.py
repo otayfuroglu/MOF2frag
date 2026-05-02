@@ -4,6 +4,7 @@ from dataclasses import dataclass
 
 import numpy as np
 from pymatgen.core import Molecule, Structure
+from pymatgen.io.cif import CifParser
 
 
 @dataclass
@@ -852,19 +853,37 @@ class COFFragmenter(BaseFragmenter):
         cutoff = min(2.2, max(1.1, cutoff))
         return dist <= cutoff
 
-    def extract(self, cif_path, output_path="cof_fragment.xyz", center_idx=-1):
+    def extract(self, cif_path, output_path="cof_fragment.xyz", center_idx=-1, minimize=False):
         print(f"Loading '{cif_path}'...")
-        struct = Structure.from_file(cif_path)
+        try:
+            struct = Structure.from_file(cif_path)
+        except Exception as exc:
+            print(f"  Standard CIF load failed: {exc}")
+            print("  Retrying with tolerant CIF parser...")
+            parser = CifParser(cif_path, occupancy_tolerance=2.1)
+            structs = parser.get_structures(primitive=False)
+            if not structs:
+                raise
+            struct = structs[0]
         print("Creating supercell...")
         dims = [max(1, int(np.ceil(28.0 / a))) for a in struct.lattice.abc]
         dims = [max(3, d) if a < 15.0 else d for d, a in zip(dims, struct.lattice.abc)]
         supercell = struct * dims
 
+        def _site_symbol(site):
+            try:
+                return site.specie.symbol
+            except Exception:
+                # Disordered site: choose highest-occupancy species.
+                return max(site.species.items(), key=lambda kv: kv[1])[0].symbol
+
+        sc_sym = [_site_symbol(site) for site in supercell]
+
         print("Building bond graph...")
         all_neigh = supercell.get_all_neighbors(r=2.4)
         graph = [[] for _ in range(len(supercell))]
         for i, neighs in enumerate(all_neigh):
-            si = supercell[i].species_string
+            si = sc_sym[i]
             ci = supercell[i].coords
             for n in neighs:
                 j = n.index
@@ -875,15 +894,194 @@ class COFFragmenter(BaseFragmenter):
                     graph[i].append(j)
                     graph[j].append(i)
 
-        if center_idx >= 0:
-            sc_center_idx = center_idx
-        else:
-            ctr = supercell.lattice.get_cartesian_coords([0.5, 0.5, 0.5])
-            sc_center_idx = min(
-                (i for i, s in enumerate(supercell) if s.species_string != "H"),
-                key=lambda i: np.linalg.norm(supercell[i].coords - ctr),
-            )
+        bo_node_species = {"B", "O"}
+        bo_node_atoms = {i for i in range(len(supercell)) if sc_sym[i] in bo_node_species}
 
+        ctr = supercell.lattice.get_cartesian_coords([0.5, 0.5, 0.5])
+
+        path_mode = "A"
+        node_atoms = set()
+        core_nodes = set()
+
+        if bo_node_atoms:
+            node_species = bo_node_species
+            node_atoms = set(bo_node_atoms)
+
+            if center_idx >= 0:
+                sc_center_idx = center_idx
+            else:
+                sc_center_idx = min(node_atoms, key=lambda i: np.linalg.norm(supercell[i].coords - ctr))
+
+            node_comps = []
+            seen = set()
+            for seed in node_atoms:
+                if seed in seen:
+                    continue
+                comp = {seed}
+                q = deque([seed])
+                seen.add(seed)
+                while q:
+                    u = q.popleft()
+                    for v in graph[u]:
+                        if v in node_atoms and v not in seen:
+                            seen.add(v)
+                            comp.add(v)
+                            q.append(v)
+                node_comps.append(comp)
+
+            center_comp = None
+            for comp in node_comps:
+                if sc_center_idx in comp:
+                    center_comp = comp
+                    break
+            if center_comp is None:
+                center_comp = {sc_center_idx}
+
+            core_nodes = set(center_comp)
+            center_sig = {}
+            for i in center_comp:
+                el = sc_sym[i]
+                center_sig[el] = center_sig.get(el, 0) + 1
+
+            layered_candidates = []
+            center_list = list(center_comp)
+            for comp in node_comps:
+                if comp is center_comp:
+                    continue
+                sig = {}
+                for i in comp:
+                    el = sc_sym[i]
+                    sig[el] = sig.get(el, 0) + 1
+                if sig != center_sig:
+                    continue
+
+                min_d = float("inf")
+                for i in center_list:
+                    ci = supercell[i].coords
+                    for j in comp:
+                        d = np.linalg.norm(ci - supercell[j].coords)
+                        if d < min_d:
+                            min_d = d
+                layered_candidates.append((min_d, comp))
+
+            if layered_candidates:
+                layered_candidates.sort(key=lambda x: x[0])
+                best_d, best_comp = layered_candidates[0]
+                if 1.0 <= best_d <= 4.5:
+                    core_nodes |= set(best_comp)
+                    path_mode = "B"
+
+            if path_mode == "B":
+                print(f"  -> COF Path B (Layered pair). Node components: 2, spacing: {best_d:.2f} A")
+            else:
+                print(f"  -> COF Path A (Single node). Node component size: {len(center_comp)}")
+
+        else:
+            # Path C for COF-3xx-like families: use tetra-connected central
+            # carbon nodes (carbon bonded to 4 heavy neighbors, mostly carbons).
+            c4_nodes = []
+            for i in range(len(supercell)):
+                if sc_sym[i] != "C":
+                    continue
+                heavy_nbs = [v for v in graph[i] if sc_sym[v] != "H"]
+                if len(heavy_nbs) < 4:
+                    continue
+                c_nbs = sum(1 for v in heavy_nbs if sc_sym[v] == "C")
+                if len(heavy_nbs) >= 4 and c_nbs >= 3:
+                    c4_nodes.append(i)
+
+            if c4_nodes:
+                node_atoms = set(c4_nodes)
+                if center_idx >= 0:
+                    sc_center_idx = center_idx
+                else:
+                    sc_center_idx = min(c4_nodes, key=lambda i: np.linalg.norm(supercell[i].coords - ctr))
+                core_nodes = {sc_center_idx}
+                path_mode = "C"
+                print(f"  -> COF Path C (Tetra-C node). Node candidates: {len(c4_nodes)}")
+            else:
+                # Path D for porphyrinic COFs (e.g., COF-366): detect N4 core.
+                n_atoms = [i for i in range(len(supercell)) if sc_sym[i] == "N"]
+                porph_cores = []
+                if n_atoms:
+                    # N-N graph by heavy-atom shortest-path proximity.
+                    n_adj = {i: set() for i in n_atoms}
+                    heavy_ok = lambda x: sc_sym[x] != "H"
+                    for ni in n_atoms:
+                        q = deque([(ni, 0)])
+                        seen = {ni}
+                        while q:
+                            u, dep = q.popleft()
+                            if dep >= 6:
+                                continue
+                            for v in graph[u]:
+                                if v in seen or (not heavy_ok(v)):
+                                    continue
+                                seen.add(v)
+                                if sc_sym[v] == "N" and v != ni:
+                                    n_adj[ni].add(v)
+                                q.append((v, dep + 1))
+
+                    # connected components on N-proximity graph
+                    n_vis = set()
+                    n_comps = []
+                    for ni in n_atoms:
+                        if ni in n_vis:
+                            continue
+                        q = deque([ni])
+                        n_vis.add(ni)
+                        comp = {ni}
+                        while q:
+                            u = q.popleft()
+                            for v in n_adj[u]:
+                                if v not in n_vis:
+                                    n_vis.add(v)
+                                    comp.add(v)
+                                    q.append(v)
+                        n_comps.append(comp)
+
+                    for ncomp in n_comps:
+                        if len(ncomp) < 4:
+                            continue
+                        # porphyrin core atoms: within 2 bonds of N set (heavy only)
+                        core = set(ncomp)
+                        q = deque([(u, 0) for u in ncomp])
+                        seen = set(ncomp)
+                        while q:
+                            u, dep = q.popleft()
+                            if dep >= 2:
+                                continue
+                            for v in graph[u]:
+                                if v in seen or (not heavy_ok(v)):
+                                    continue
+                                seen.add(v)
+                                core.add(v)
+                                q.append((v, dep + 1))
+                        porph_cores.append(core)
+
+                if porph_cores:
+                    # pick core nearest supercell center
+                    def core_ctr(core):
+                        return np.mean([supercell[i].coords for i in core], axis=0)
+                    core_nodes = min(porph_cores, key=lambda c: np.linalg.norm(core_ctr(c) - ctr))
+                    node_atoms = set().union(*porph_cores)
+                    if center_idx >= 0:
+                        sc_center_idx = center_idx
+                    else:
+                        sc_center_idx = min(core_nodes, key=lambda i: np.linalg.norm(supercell[i].coords - ctr))
+                    path_mode = "D"
+                    print(f"  -> COF Path D (Porphyrin core). N-rich cores: {len(porph_cores)}")
+                else:
+                    node_atoms = set()
+                    if center_idx >= 0:
+                        sc_center_idx = center_idx
+                    else:
+                        sc_center_idx = min(
+                            (i for i in range(len(supercell)) if sc_sym[i] != "H"),
+                            key=lambda i: np.linalg.norm(supercell[i].coords - ctr),
+                        )
+                    core_nodes = {sc_center_idx}
+                    print("  -> COF Path A (Fallback single-center mode).")
         unwrapped = [None] * len(supercell)
         unwrapped[sc_center_idx] = np.array(supercell[sc_center_idx].coords)
         q = deque([sc_center_idx])
@@ -905,26 +1103,285 @@ class COFFragmenter(BaseFragmenter):
 
         cpos = np.array(unwrapped[sc_center_idx])
         sphere = {i for i in range(len(supercell)) if np.linalg.norm(np.array(unwrapped[i]) - cpos) <= self.radius}
-        keep = {sc_center_idx}
-        q = deque([sc_center_idx])
-        while q:
-            i = q.popleft()
-            for j in graph[i]:
-                if j in sphere and j not in keep:
-                    keep.add(j)
-                    q.append(j)
 
-        ordered = sorted(keep)
-        species = [supercell[i].species_string for i in ordered]
+        # Grow from core B/O nodes only; this avoids detached islands from
+        # direct sphere-seeding while still keeping local linker chemistry.
+        final = set(core_nodes)
+        visited = set(core_nodes)
+        queue = deque(core_nodes)
+        broken = []
+        while queue:
+            u = queue.popleft()
+            su = sc_sym[u]
+            if u in node_atoms and u not in core_nodes:
+                continue
+            for v in graph[u]:
+                if v in node_atoms and v not in core_nodes:
+                    broken.append((u, np.array(unwrapped[v]) - np.array(unwrapped[u])))
+                    continue
+                if v in visited:
+                    continue
+                visited.add(v)
+                final.add(v)
+                queue.append(v)
+
+        ordered = sorted(final)
+        local = {gi: li for li, gi in enumerate(ordered)}
+        species = [sc_sym[i] for i in ordered]
         coords = [np.array(unwrapped[i]) for i in ordered]
+
+        broken_by_parent = {}
+        for gi, vec in broken:
+            broken_by_parent.setdefault(gi, []).append(vec)
+
+        # Build kept-neighbor map in final fragment to improve capping direction
+        # at linker termini (place H away from preserved bonded atoms).
+        final_set = set(final)
+        kept_neighbor_vectors = {}
+        for gi in broken_by_parent:
+            neigh_vecs = []
+            gpos = np.array(unwrapped[gi])
+            for nb in graph[gi]:
+                if nb in final_set:
+                    neigh_vecs.append(np.array(unwrapped[nb]) - gpos)
+            kept_neighbor_vectors[gi] = neigh_vecs
+
+        for gi, vecs in broken_by_parent.items():
+            li = local.get(gi)
+            if li is None:
+                continue
+            if species[li] == "H":
+                continue
+            if species[li] == "O" and self.oxygen_already_protonated(li, species, coords):
+                continue
+
+            # Primary direction: opposite of vectors to kept neighbors.
+            dir_vec = np.zeros(3)
+            kv = kept_neighbor_vectors.get(gi, [])
+            if kv:
+                for v in kv:
+                    dir_vec -= v
+            else:
+                # Fallback: old behavior from removed-side average.
+                for v in vecs:
+                    dir_vec += v
+
+            self.place_capping_h(li, dir_vec, self.cap_bond_length(species[li]), species, coords, min_hh=1.5)
+
+        if minimize and species:
+            # COF minimize target:
+            # 1) keep one whole linker branch
+            # 2) for other branches keep only first benzene ring near node
+            heavy_idx = [i for i, sp in enumerate(species) if sp != "H"]
+            if heavy_idx:
+                hset = set(heavy_idx)
+                hadj = {i: [] for i in heavy_idx}
+                for a in range(len(heavy_idx)):
+                    i = heavy_idx[a]
+                    ci = np.array(coords[i])
+                    for b in range(a + 1, len(heavy_idx)):
+                        j = heavy_idx[b]
+                        d = np.linalg.norm(ci - np.array(coords[j]))
+                        if self.is_valid_bond(species[i], species[j], d):
+                            hadj[i].append(j)
+                            hadj[j].append(i)
+
+                local_nodes = {local[g] for g in core_nodes if g in local}
+                organic = [i for i in heavy_idx if i not in local_nodes]
+                organic_set = set(organic)
+
+                # Organic connected components (excluding node atoms).
+                comps = []
+                vis = set()
+                for i in organic:
+                    if i in vis:
+                        continue
+                    q = deque([i])
+                    vis.add(i)
+                    comp = {i}
+                    while q:
+                        u = q.popleft()
+                        for v in hadj[u]:
+                            if v in organic_set and v not in vis:
+                                vis.add(v)
+                                comp.add(v)
+                                q.append(v)
+                    comps.append(comp)
+
+                # Score each component by node attachments.
+                comp_info = []
+                for comp in comps:
+                    touching_nodes = set()
+                    bridge_atoms = set()
+                    for u in comp:
+                        for v in hadj[u]:
+                            if v in local_nodes:
+                                touching_nodes.add(v)
+                                bridge_atoms.add(u)
+                    comp_info.append((comp, touching_nodes, bridge_atoms))
+
+                # Choose one whole linker branch to keep fully.
+                if comp_info:
+                    primary = max(comp_info, key=lambda x: (len(x[1]), len(x[0])))
+                    keep_heavy = set(local_nodes) | set(primary[0])
+                else:
+                    keep_heavy = set(local_nodes) if local_nodes else {heavy_idx[0]}
+
+                def find_six_cycle(comp, bridge_atoms):
+                    carbon = {u for u in comp if species[u] == "C"}
+                    if len(carbon) < 6:
+                        return set()
+                    cadj = {u: [v for v in hadj[u] if v in carbon] for u in carbon}
+
+                    seeds = [u for u in bridge_atoms if u in carbon]
+                    if not seeds:
+                        seeds = list(carbon)
+
+                    def dfs(start, cur, path, used):
+                        if len(path) == 6:
+                            if start in cadj[cur]:
+                                return list(path)
+                            return None
+                        for nb in cadj[cur]:
+                            if nb in used:
+                                continue
+                            used.add(nb)
+                            path.append(nb)
+                            got = dfs(start, nb, path, used)
+                            if got is not None:
+                                return got
+                            path.pop()
+                            used.remove(nb)
+                        return None
+
+                    for st in seeds:
+                        got = dfs(st, st, [st], {st})
+                        if got is not None:
+                            return set(got)
+                    return set()
+
+                # For non-primary branches keep first benzene ring only.
+                for comp, touching_nodes, bridge_atoms in comp_info:
+                    if primary and comp is primary[0]:
+                        continue
+                    ring = find_six_cycle(comp, bridge_atoms)
+                    if ring:
+                        keep_heavy |= ring
+                    else:
+                        # Fallback if no clear benzene ring found: keep up to
+                        # six nearest carbons from bridge atoms.
+                        seeds = list(bridge_atoms) if bridge_atoms else list(comp)[:1]
+                        q = deque(seeds)
+                        dist = {u: 0 for u in seeds}
+                        seen = set(seeds)
+                        carbons = []
+                        while q and len(carbons) < 6:
+                            u = q.popleft()
+                            if u in comp and species[u] == "C":
+                                carbons.append(u)
+                            for v in hadj[u]:
+                                if v in comp and v not in seen:
+                                    seen.add(v)
+                                    dist[v] = dist[u] + 1
+                                    q.append(v)
+                        keep_heavy |= set(carbons)
+
+                # Preserve N atoms adjacent to kept carbon fragments (important
+                # for porphyrinic / imine motifs in COF-3xx), then add capping H
+                # if those N become terminal after trimming.
+                for nidx in heavy_idx:
+                    if species[nidx] != "N" or nidx in keep_heavy:
+                        continue
+                    if any((nb in keep_heavy and species[nb] in {"C", "N"}) for nb in hadj[nidx]):
+                        keep_heavy.add(nidx)
+
+                # Keep hydrogens bonded to retained heavy atoms.
+                keep = set(keep_heavy)
+                for i, sp in enumerate(species):
+                    if sp != "H":
+                        continue
+                    ci = np.array(coords[i])
+                    for j in keep_heavy:
+                        d = np.linalg.norm(ci - np.array(coords[j]))
+                        if self.is_valid_bond("H", species[j], d):
+                            keep.add(i)
+                            break
+
+                species = [x for i, x in enumerate(species) if i in keep]
+                coords = [x for i, x in enumerate(coords) if i in keep]
+
+                # Post-trim N capping: if retained N has low retained valence,
+                # place one H opposite to kept neighbors.
+                hset2 = [i for i, sp in enumerate(species) if sp != "H"]
+                hadj2 = {i: [] for i in hset2}
+                for a in range(len(hset2)):
+                    i = hset2[a]
+                    ci = np.array(coords[i])
+                    for b in range(a + 1, len(hset2)):
+                        j = hset2[b]
+                        d = np.linalg.norm(ci - np.array(coords[j]))
+                        if self.is_valid_bond(species[i], species[j], d):
+                            hadj2[i].append(j)
+                            hadj2[j].append(i)
+
+                for i, sp in list(enumerate(species)):
+                    if sp != "N":
+                        continue
+                    kept_nbs = hadj2.get(i, [])
+                    if len(kept_nbs) >= 2:
+                        continue
+                    base = np.zeros(3)
+                    if kept_nbs:
+                        for nb in kept_nbs:
+                            base -= (np.array(coords[nb]) - np.array(coords[i]))
+                    else:
+                        base = np.array([1.0, 0.0, 0.0])
+                    self.place_capping_h(i, base, self.cap_bond_length("N"), species, coords, min_hh=1.5)
+
+        # Keep a single connected component for Path A.
+        # For Path B (stacked dimer-like layers), keep both principal layers.
+        if species:
+            adj = [[] for _ in range(len(species))]
+            for i in range(len(species)):
+                ci = np.array(coords[i])
+                for j in range(i + 1, len(species)):
+                    d = np.linalg.norm(ci - np.array(coords[j]))
+                    if self.is_valid_bond(species[i], species[j], d):
+                        adj[i].append(j)
+                        adj[j].append(i)
+            comps = []
+            vis = set()
+            for i in range(len(species)):
+                if i in vis:
+                    continue
+                q = deque([i])
+                vis.add(i)
+                comp = {i}
+                while q:
+                    u = q.popleft()
+                    for v in adj[u]:
+                        if v not in vis:
+                            vis.add(v)
+                            comp.add(v)
+                            q.append(v)
+                comps.append(comp)
+            if len(comps) > 1:
+                def comp_key(comp):
+                    node_ct = sum(1 for k in comp if species[k] in {"B", "O"})
+                    return (node_ct, len(comp))
+                if path_mode == "B":
+                    ranked = sorted(comps, key=comp_key, reverse=True)
+                    keep = set().union(*ranked[:2])
+                else:
+                    keep = max(comps, key=comp_key)
+                species = [x for i, x in enumerate(species) if i in keep]
+                coords = [x for i, x in enumerate(coords) if i in keep]
 
         print(f"Final size: {len(species)} atoms")
         mol = Molecule(species, coords)
         mol.to(filename=output_path, fmt="xyz")
         print(f"Saved: {output_path}")
         return FragmentResult(species=species, coords=coords)
-
-
 def main():
     parser = argparse.ArgumentParser(description="OOP fragmenter core for MOF/COF")
     parser.add_argument("cif_path")
@@ -941,7 +1398,7 @@ def main():
         frag.extract(args.cif_path, center_idx=args.center, nmetals=args.nmetals, output_path=args.output, minimize=args.minimize)
     else:
         frag = COFFragmenter(radius=args.radius)
-        frag.extract(args.cif_path, center_idx=args.center, output_path=args.output)
+        frag.extract(args.cif_path, center_idx=args.center, output_path=args.output, minimize=args.minimize)
 
 
 if __name__ == "__main__":

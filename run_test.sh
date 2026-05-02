@@ -1,13 +1,9 @@
 #!/bin/bash
-# ============================================================
-# MOF2frag Test Script
-# Tests Path A (discrete 0D clusters) and Path B (infinite rods)
-# ============================================================
+# COF-only test runner for UniFrag (fragmentation_oop.py)
 
 PYTHON="/Users/omert/miniconda3/bin/python"
-OOP_SCRIPT="$(dirname "$0")/fragmentation_oop.py"
-ENGINE="oop"
-KIND="mof"
+SCRIPT="$(dirname "$0")/fragmentation_oop.py"
+COF_DIR="$(dirname "$0")/test_on_cof_1xx_series"
 
 GREEN='\033[0;32m'
 YELLOW='\033[1;33m'
@@ -15,179 +11,98 @@ RED='\033[0;31m'
 CYAN='\033[0;36m'
 NC='\033[0m'
 
+RADIUS="${1:-4.0}"
+
 pass=0
 fail=0
 
-while [[ $# -gt 0 ]]; do
-    case "$1" in
-        --engine)
-            ENGINE="$2"
-            shift 2
-            ;;
-        --kind)
-            KIND="$2"
-            shift 2
-            ;;
-        *)
-            echo "Unknown arg: $1"
-            echo "Usage: $0 [--engine oop] [--kind mof|cof]"
-            exit 1
-            ;;
-    esac
-done
+run_one() {
+    local cif="$1"
+    local base
+    base="$(basename "${cif%.*}")"
+    local out="${COF_DIR}/${base}_frag_cof.xyz"
 
-if [[ "$ENGINE" != "oop" ]]; then
-    echo "Invalid --engine: $ENGINE (only 'oop' is supported)"
-    exit 1
-fi
-
-if [[ "$KIND" != "mof" && "$KIND" != "cof" ]]; then
-    echo "Invalid --kind: $KIND (expected mof|cof)"
-    exit 1
-fi
-
-echo "============================================================"
-echo "  MOF2frag — Automated Test Suite"
-echo "============================================================"
-echo "  Engine: $ENGINE"
-[[ "$ENGINE" == "oop" ]] && echo "  Kind: $KIND"
-echo ""
-
-run_test() {
-    local label="$1"
-    local cif="$2"
-    local radius="$3"
-    local nmetals="$4"
-    local extra_args="$5"
-    local suffix="_frag"
-    [[ "$extra_args" == *"--minimize"* ]] && suffix="_frag_min"
-    local outfile="$(dirname "$cif")/$(basename "${cif%.*}")${suffix}.xyz"
-
-    echo -e "${YELLOW}▶ $label${NC}"
-    if [[ "$ENGINE" == "oop" ]]; then
-        output=$($PYTHON "$OOP_SCRIPT" "$cif" --kind "$KIND" --radius "$radius" --nmetals "$nmetals" --output "$outfile" $extra_args 2>&1)
-    else
-        echo "  [skip] legacy engine removed; use --engine oop"
-        return
-    fi
+    echo -e "${YELLOW}▶ ${base}${NC}"
+    output=$($PYTHON "$SCRIPT" "$cif" --kind cof --radius "$RADIUS" --output "$out" 2>&1)
 
     if [ $? -ne 0 ]; then
-        echo -e "  ${RED}✗ FAILED to run${NC}"
+        echo -e "  ${RED}✗ FAILED${NC}"
         echo "  $output"
         ((fail++))
         echo ""
         return
     fi
 
-    sbu_line=$(echo "$output" | grep -E "Path A|Path B|Path C")
+    path_line=$(echo "$output" | grep -E "COF Path A|COF Path B")
     final_line=$(echo "$output" | grep "Final size")
-    prune_line=$(echo "$output" | grep "Removed")
-    comp=$($PYTHON -c "from collections import Counter; c=Counter([l.split()[0] for l in open('$outfile').readlines()[2:] if l.strip()]); print(dict(c))" 2>/dev/null)
 
-    echo "  $sbu_line"
-    [ -n "$prune_line" ] && echo "  $prune_line"
+    comp=$($PYTHON -c "from collections import Counter; c=Counter([l.split()[0] for l in open('$out').readlines()[2:] if l.strip()]); print(dict(c))" 2>/dev/null)
+
+    comps=$($PYTHON - <<PY
+from collections import deque
+import numpy as np
+
+METALS={'Mg','Zn','Cu','Fe','Co','Ni','Mn','Zr','Ti','V','Cr','Al'}
+LARGE={'Br','I','S','P','Cl'}
+
+def vb(a,b,d):
+    if a in METALS or b in METALS: return d < 2.6
+    if 'H' in (a,b): return d < 1.2
+    if a in LARGE or b in LARGE: return d < 2.2
+    return d < 1.8
+
+sp=[]; co=[]
+for ln in open("$out").read().splitlines()[2:]:
+    if not ln.strip(): continue
+    t=ln.split()
+    sp.append(t[0])
+    co.append(np.array(list(map(float,t[1:4]))))
+
+n=len(sp)
+adj=[[] for _ in range(n)]
+for i in range(n):
+    for j in range(i+1,n):
+        d=np.linalg.norm(co[i]-co[j])
+        if vb(sp[i],sp[j],d):
+            adj[i].append(j); adj[j].append(i)
+
+vis=set(); sizes=[]
+for i in range(n):
+    if i in vis: continue
+    q=deque([i]); vis.add(i); c=1
+    while q:
+        u=q.popleft()
+        for v in adj[u]:
+            if v not in vis:
+                vis.add(v); q.append(v); c+=1
+    sizes.append(c)
+
+sizes=sorted(sizes, reverse=True)
+print(f"{len(sizes)} components; sizes={sizes[:6]}")
+PY
+)
+
+    echo "  $path_line"
     echo "  $final_line"
     echo "  Composition: $comp"
-    echo -e "  Output: ${GREEN}$outfile${NC}"
+    echo "  Connectivity: $comps"
+    echo -e "  Output: ${GREEN}$out${NC}"
     ((pass++))
     echo ""
 }
 
-# ===== PATH B: MOF-74 series (infinite metal rods) =====
-echo -e "${CYAN}============================================================${NC}"
-echo -e "${CYAN}  PATH B — Infinite Metal Lattice (MOF-74 series)${NC}"
-echo -e "${CYAN}============================================================${NC}"
+echo "============================================================"
+echo "  UniFrag — COF Test Suite"
+echo "============================================================"
+echo "  Folder: $COF_DIR"
+echo "  Radius: $RADIUS"
 echo ""
 
-for cif in "$(dirname "$0")"/test/*.cif; do
-    name=$(basename "$cif" .cif)
-    run_test "MOF-74: $name (3 metals)" "$cif" 4.0 3 ""
+for cif in "$COF_DIR"/*.cif; do
+    run_one "$cif"
 done
 
-# Also test with 5 metals on Cu MOF-74
-if [ -f "$(dirname "$0")/test/1516648.cif" ]; then
-    run_test "MOF-74: 1516648 (5 metals)" "$(dirname "$0")/test/1516648.cif" 4.0 5 ""
-fi
-
-# ===== PATH A: IRMOF series (discrete 0D Zn4O clusters) =====
-echo -e "${CYAN}============================================================${NC}"
-echo -e "${CYAN}  PATH A — Discrete 0D Clusters (IRMOF series)${NC}"
-echo -e "${CYAN}============================================================${NC}"
-echo ""
-
-for cif in "$(dirname "$0")"/test_on_irmof_series/*.cif; do
-    name=$(basename "$cif" .cif)
-    run_test "IRMOF: $name" "$cif" 4.0 3 ""
-done
-
-# ===== PATH A & B: MIL Series (Discrete & Infinite chains) =====
-echo -e "${CYAN}============================================================${NC}"
-echo -e "${CYAN}  PATH A & PATH B — MIL Series (Discrete & Infinite)${NC}"
-echo -e "${CYAN}============================================================${NC}"
-echo ""
-
-for cif in "$(dirname "$0")"/test_on_mil_series/*.cif; do
-    name=$(basename "$cif" .cif)
-    run_test "MIL: $name" "$cif" 4.0 3 ""
-done
-
-# ===== PATH A: PCN Series (Discrete clusters) =====
-echo -e "${CYAN}============================================================${NC}"
-echo -e "${CYAN}  PATH A — PCN Series${NC}"
-echo -e "${CYAN}============================================================${NC}"
-echo ""
-
-for cif in "$(dirname "$0")"/test_on_pcn_series/*.cif; do
-    name=$(basename "$cif" .cif)
-    run_test "PCN: $name" "$cif" 4.0 3 ""
-done
-
-# ============================================================
-#  MINIMIZE MODE — All series re-run with --minimize
-# ============================================================
-
-echo -e "${CYAN}============================================================${NC}"
-echo -e "${CYAN}  MINIMIZE MODE — MOF-74 Series${NC}"
-echo -e "${CYAN}============================================================${NC}"
-echo ""
-
-for cif in "$(dirname "$0")"/test/*.cif; do
-    name=$(basename "$cif" .cif)
-    run_test "MOF-74 [min]: $name (3 metals)" "$cif" 4.0 3 "--minimize"
-done
-
-echo -e "${CYAN}============================================================${NC}"
-echo -e "${CYAN}  MINIMIZE MODE — IRMOF Series${NC}"
-echo -e "${CYAN}============================================================${NC}"
-echo ""
-
-for cif in "$(dirname "$0")"/test_on_irmof_series/*.cif; do
-    name=$(basename "$cif" .cif)
-    run_test "IRMOF [min]: $name" "$cif" 4.0 3 "--minimize"
-done
-
-echo -e "${CYAN}============================================================${NC}"
-echo -e "${CYAN}  MINIMIZE MODE — MIL Series${NC}"
-echo -e "${CYAN}============================================================${NC}"
-echo ""
-
-for cif in "$(dirname "$0")"/test_on_mil_series/*.cif; do
-    name=$(basename "$cif" .cif)
-    run_test "MIL [min]: $name" "$cif" 4.0 3 "--minimize"
-done
-
-echo -e "${CYAN}============================================================${NC}"
-echo -e "${CYAN}  MINIMIZE MODE — PCN Series${NC}"
-echo -e "${CYAN}============================================================${NC}"
-echo ""
-
-for cif in "$(dirname "$0")"/test_on_pcn_series/*.cif; do
-    name=$(basename "$cif" .cif)
-    run_test "PCN [min]: $name" "$cif" 4.0 3 "--minimize"
-done
-
-# ===== Summary =====
 echo "============================================================"
 echo -e "  Results: ${GREEN}$pass passed${NC}, ${RED}$fail failed${NC}"
-echo "  Output XYZ files saved next to their source CIF files."
 echo "============================================================"
+
