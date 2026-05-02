@@ -3,7 +3,7 @@ set -euo pipefail
 
 PYTHON="/Users/omert/miniconda3/bin/python"
 SCRIPT="/Users/omert/Desktop/MOF2frag/fragmentation_oop.py"
-DIR="/Users/omert/Desktop/MOF2frag/test_on_zif_series"
+DIR="/Users/omert/Desktop/MOF2frag/test_on_nu_series"
 
 for cif in "$DIR"/*.cif; do
   [ -e "$cif" ] || continue

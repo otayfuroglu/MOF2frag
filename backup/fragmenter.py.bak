@@ -237,6 +237,10 @@ def extract_fragment(mof_path, center_idx=-1, radius=6.0, nmetals=3, output_path
             best_size = float('inf')
             best_result = None
             best_dist = float('inf')
+            best_valid_size = float('inf')
+            best_valid_result = None
+            best_valid_dist = float('inf')
+            expected_metals = len(sbu_metals) * 2
             
             for idx, candidate in enumerate(candidates_to_test):
                 test_core = set(sbu_metals) | candidate[0]
@@ -244,15 +248,25 @@ def extract_fragment(mof_path, center_idx=-1, radius=6.0, nmetals=3, output_path
                 sp, co = get_fragment(test_core, test_init, supercell, sc_center_idx, metals, is_infinite_sbu, nmetals, minimize, zif_mode)
                 
                 sz = len(sp)
+                metal_ct = sum(1 for x in sp if x in metals)
                 dist_val = np.linalg.norm(candidate[2] - c1)
-                print(f"       Candidate {idx+1} (dist {dist_val:.2f} A) -> {sz} atoms")
+                print(f"       Candidate {idx+1} (dist {dist_val:.2f} A) -> {sz} atoms, {metal_ct} metals")
                 if sz < best_size or (sz == best_size and dist_val < best_dist):
                     best_size = sz
                     best_result = (sp, co)
                     best_dist = dist_val
+                if metal_ct >= expected_metals:
+                    if sz < best_valid_size or (sz == best_valid_size and dist_val < best_valid_dist):
+                        best_valid_size = sz
+                        best_valid_result = (sp, co)
+                        best_valid_dist = dist_val
                     
-            print(f"     Selected SBU candidate yielding {best_size} atoms.")
-            final_species, final_coords = best_result
+            if best_valid_result is not None:
+                print(f"     Selected metal-complete SBU candidate yielding {best_valid_size} atoms.")
+                final_species, final_coords = best_valid_result
+            else:
+                print(f"     No metal-complete candidate found. Selected smallest candidate yielding {best_size} atoms.")
+                final_species, final_coords = best_result
         else:
             print("     Could not find adjacent SBU. Reverting to 1 SBU.")
             core_metals = set(sbu_metals)
@@ -546,14 +560,85 @@ def get_fragment(core_metals, initial_indices, supercell, sc_center_idx, metals,
             comps.append(comp)
 
         if len(comps) > 1:
-            def comp_key(comp):
-                core_count = sum(1 for i in comp if i in core_metals)
-                metal_count = sum(1 for i in comp if supercell[i].species_string in metals)
-                return (core_count, metal_count, len(comp))
+            comp_core = [set(i for i in comp if i in core_metals) for comp in comps]
+            comp_metal_ct = [sum(1 for i in comp if supercell[i].species_string in metals) for comp in comps]
 
-            best_comp = max(comps, key=comp_key)
-            final_indices = {idx for idx in final_indices if (idx in best_comp) or (supercell[idx].species_string == "H")}
+            full_cover = [k for k, cset in enumerate(comp_core) if len(cset) == len(core_metals)]
+            if full_cover:
+                best_k = max(full_cover, key=lambda k: (comp_metal_ct[k], -len(comps[k])))
+                keep_heavy = set(comps[best_k])
+            else:
+                uncovered = set(core_metals)
+                chosen = []
+                remaining = set(range(len(comps)))
+                while uncovered and remaining:
+                    best_k = max(
+                        remaining,
+                        key=lambda k: (len(comp_core[k] & uncovered), comp_metal_ct[k], -len(comps[k])),
+                    )
+                    gain = comp_core[best_k] & uncovered
+                    if not gain:
+                        break
+                    chosen.append(best_k)
+                    uncovered -= gain
+                    remaining.remove(best_k)
+                if chosen:
+                    keep_heavy = set().union(*[comps[k] for k in chosen])
+                else:
+                    def comp_key(comp):
+                        core_count = sum(1 for i in comp if i in core_metals)
+                        metal_count = sum(1 for i in comp if supercell[i].species_string in metals)
+                        return (core_count, metal_count, len(comp))
+                    keep_heavy = max(comps, key=comp_key)
+            final_indices = {idx for idx in final_indices if (idx in keep_heavy) or (supercell[idx].species_string == "H")}
             broken_bonds = [(l, n) for l, n in broken_bonds if l in final_indices]
+
+    # Re-unwrap final fragment from a single anchor so periodic images are
+    # consistent in primitive-cell cases (avoids visually split fragments).
+    anchor_idx = sc_center_idx if sc_center_idx in final_indices else next(iter(final_indices))
+    old_unwrapped = {idx: np.array(unwrapped_coords[idx]) for idx in final_indices if idx in unwrapped_coords}
+    rebuilt_unwrapped = {anchor_idx: np.array(supercell[anchor_idx].coords)}
+    q = deque([anchor_idx])
+    while q:
+        cur = q.popleft()
+        cur_site = supercell[cur]
+        cur_frac = np.array(cur_site.frac_coords)
+        cur_pos = rebuilt_unwrapped[cur]
+        for n in sc_all_neighbors[cur]:
+            nb = n.index
+            if nb not in final_indices or nb in rebuilt_unwrapped:
+                continue
+            d = np.linalg.norm(n.coords - cur_site.coords)
+            if not is_valid_bond(cur_site.species_string, n.species_string, d):
+                continue
+            nb_frac = np.array(supercell[nb].frac_coords)
+            dfrac = nb_frac - cur_frac
+            dfrac -= np.round(dfrac)
+            rebuilt_unwrapped[nb] = cur_pos + supercell.lattice.get_cartesian_coords(dfrac)
+            q.append(nb)
+    for idx in final_indices:
+        if idx not in rebuilt_unwrapped:
+            rebuilt_unwrapped[idx] = np.array(unwrapped_coords[idx])
+    unwrapped_coords.update(rebuilt_unwrapped)
+
+    # Shift stored broken-bond endpoint coordinates by the same parent-anchor
+    # translation to keep capping vectors consistent after re-wrapping.
+    delta_by_idx = {}
+    for idx in final_indices:
+        if idx in old_unwrapped:
+            delta_by_idx[idx] = unwrapped_coords[idx] - old_unwrapped[idx]
+    if delta_by_idx:
+        new_broken = []
+        for l, npos in broken_bonds:
+            shift = delta_by_idx.get(l, np.zeros(3))
+            new_broken.append((l, np.array(npos) + shift))
+        broken_bonds = new_broken
+
+        shifted_bridge = []
+        for ba, removed_coords in bridge_atoms_to_cap:
+            shift = delta_by_idx.get(ba, np.zeros(3))
+            shifted_bridge.append((ba, [np.array(rc) + shift for rc in removed_coords]))
+        bridge_atoms_to_cap = shifted_bridge
 
     # 4. Capping & Save
     ordered_indices = sorted(final_indices)
@@ -746,10 +831,12 @@ def get_fragment(core_metals, initial_indices, supercell, sc_center_idx, metals,
                 comps.append(comp)
 
             if len(comps) > 1:
-                def comp_key(comp):
-                    m = sum(1 for i in comp if species[i] in metals)
-                    return (m, len(comp))
-                keep_heavy = max(comps, key=comp_key)
+                metal_counts = [sum(1 for i in comp if species[i] in metals) for comp in comps]
+                max_m = max(metal_counts)
+                if max_m > 0:
+                    keep_heavy = set().union(*[comp for comp, m in zip(comps, metal_counts) if m == max_m])
+                else:
+                    keep_heavy = max(comps, key=len)
                 keep = set(keep_heavy)
                 for i, s in enumerate(species):
                     if s != "H":

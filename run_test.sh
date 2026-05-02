@@ -5,7 +5,9 @@
 # ============================================================
 
 PYTHON="/Users/omert/miniconda3/bin/python"
-SCRIPT="$(dirname "$0")/fragmenter.py"
+OOP_SCRIPT="$(dirname "$0")/fragmentation_oop.py"
+ENGINE="oop"
+KIND="mof"
 
 GREEN='\033[0;32m'
 YELLOW='\033[1;33m'
@@ -13,13 +15,43 @@ RED='\033[0;31m'
 CYAN='\033[0;36m'
 NC='\033[0m'
 
+pass=0
+fail=0
+
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --engine)
+            ENGINE="$2"
+            shift 2
+            ;;
+        --kind)
+            KIND="$2"
+            shift 2
+            ;;
+        *)
+            echo "Unknown arg: $1"
+            echo "Usage: $0 [--engine oop] [--kind mof|cof]"
+            exit 1
+            ;;
+    esac
+done
+
+if [[ "$ENGINE" != "oop" ]]; then
+    echo "Invalid --engine: $ENGINE (only 'oop' is supported)"
+    exit 1
+fi
+
+if [[ "$KIND" != "mof" && "$KIND" != "cof" ]]; then
+    echo "Invalid --kind: $KIND (expected mof|cof)"
+    exit 1
+fi
+
 echo "============================================================"
 echo "  MOF2frag — Automated Test Suite"
 echo "============================================================"
+echo "  Engine: $ENGINE"
+[[ "$ENGINE" == "oop" ]] && echo "  Kind: $KIND"
 echo ""
-
-pass=0
-fail=0
 
 run_test() {
     local label="$1"
@@ -32,7 +64,12 @@ run_test() {
     local outfile="$(dirname "$cif")/$(basename "${cif%.*}")${suffix}.xyz"
 
     echo -e "${YELLOW}▶ $label${NC}"
-    output=$($PYTHON "$SCRIPT" "$cif" --radius "$radius" --nmetals "$nmetals" --output "$outfile" $extra_args 2>&1)
+    if [[ "$ENGINE" == "oop" ]]; then
+        output=$($PYTHON "$OOP_SCRIPT" "$cif" --kind "$KIND" --radius "$radius" --nmetals "$nmetals" --output "$outfile" $extra_args 2>&1)
+    else
+        echo "  [skip] legacy engine removed; use --engine oop"
+        return
+    fi
 
     if [ $? -ne 0 ]; then
         echo -e "  ${RED}✗ FAILED to run${NC}"

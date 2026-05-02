@@ -2,7 +2,9 @@
 # Quick regression test for MOF2frag (one MOF per family)
 
 PYTHON="/Users/omert/miniconda3/bin/python"
-SCRIPT="$(dirname "$0")/fragmenter.py"
+OOP_SCRIPT="$(dirname "$0")/fragmentation_oop.py"
+ENGINE="oop"
+KIND="mof"
 
 GREEN='\033[0;32m'
 YELLOW='\033[1;33m'
@@ -12,6 +14,29 @@ NC='\033[0m'
 
 pass=0
 fail=0
+
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --engine)
+            ENGINE="$2"
+            shift 2
+            ;;
+        --kind)
+            KIND="$2"
+            shift 2
+            ;;
+        *)
+            echo "Unknown arg: $1"
+            echo "Usage: $0 [--engine oop] [--kind mof|cof]"
+            exit 1
+            ;;
+    esac
+done
+
+if [[ "$ENGINE" != "oop" ]]; then
+    echo "Invalid --engine: $ENGINE (only 'oop' is supported)"
+    exit 1
+fi
 
 run_test() {
     local label="$1"
@@ -25,7 +50,12 @@ run_test() {
     local outfile="$(dirname "$cif")/$(basename "${cif%.*}")${suffix}.xyz"
 
     echo -e "${YELLOW}▶ $label${NC}"
-    output=$($PYTHON "$SCRIPT" "$cif" --radius "$radius" --nmetals "$nmetals" --output "$outfile" $extra_args 2>&1)
+    if [[ "$ENGINE" == "oop" ]]; then
+        output=$($PYTHON "$OOP_SCRIPT" "$cif" --kind "$KIND" --radius "$radius" --nmetals "$nmetals" --output "$outfile" $extra_args 2>&1)
+    else
+        echo "  [skip] legacy engine removed; use --engine oop"
+        return
+    fi
 
     if [ $? -ne 0 ]; then
         echo -e "  ${RED}✗ FAILED${NC}"
@@ -47,6 +77,8 @@ run_test() {
 echo "============================================================"
 echo "  MOF2frag — Fast Test Suite (1 per family)"
 echo "============================================================"
+echo "  Engine: $ENGINE"
+[[ "$ENGINE" == "oop" ]] && echo "  Kind: $KIND"
 echo ""
 
 # One representative MOF per family
