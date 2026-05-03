@@ -1,4 +1,4 @@
-# MOF2frag
+# UniFrag
 
 MOF2frag is a Python script designed to cleanly and robustly extract chemically-meaningful symmetric cluster models from Metal-Organic Framework (MOF) `.cif` files. It is specifically optimized for creating stable models for Density Functional Theory (DFT) calculations by using an intelligently-anchored Graph Breadth-First-Search.
 
