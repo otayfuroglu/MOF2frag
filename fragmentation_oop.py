@@ -23,6 +23,10 @@ class BaseFragmenter:
             return 1.09
         if site_species == "N":
             return 1.01
+        if site_species == "Si":
+            return 1.48
+        if site_species == "B":
+            return 1.19
         return 0.96
 
     @staticmethod
@@ -54,7 +58,7 @@ class BaseFragmenter:
                     min_heavy = d
         return min_h, min_heavy
 
-    def place_capping_h(self, parent_idx, base_vec, bl, species, coords, min_hh=1.5, min_heavy=0.9, min_o_contact=1.5):
+    def place_capping_h(self, parent_idx, base_vec, bl, species, coords, min_hh=1.5, min_heavy=0.9, min_o_contact=1.5, capped_h_flags=None):
         parent_pos = np.array(coords[parent_idx])
         vnorm = np.linalg.norm(base_vec)
         if vnorm < 1e-12:
@@ -94,6 +98,8 @@ class BaseFragmenter:
             if mh >= min_hh and mheavy >= min_heavy:
                 species.append("H")
                 coords.append(cand)
+                if capped_h_flags is not None:
+                    capped_h_flags.append(True)
                 return
 
     @staticmethod
@@ -107,6 +113,151 @@ class BaseFragmenter:
             if np.linalg.norm(opos - np.array(coords[i])) <= oh_cutoff:
                 return True
         return False
+
+    def refine_h_geometry_with_rdkit(self, species, coords, capped_h_indices=None, max_iters=300):
+        if not species or "H" not in species:
+            return
+        try:
+            from rdkit import Chem
+            from rdkit.Chem import AllChem
+            from rdkit.Geometry import Point3D
+        except Exception:
+            return
+
+        try:
+            rw = Chem.RWMol()
+            for sp in species:
+                rw.AddAtom(Chem.Atom(sp))
+
+            n = len(species)
+            for i in range(n):
+                ci = np.array(coords[i], dtype=float)
+                for j in range(i + 1, n):
+                    d = np.linalg.norm(ci - np.array(coords[j], dtype=float))
+                    if self.is_valid_bond(species[i], species[j], d):
+                        rw.AddBond(i, j, Chem.BondType.SINGLE)
+
+            mol = rw.GetMol()
+            mol.UpdatePropertyCache(strict=False)
+            try:
+                Chem.SanitizeMol(
+                    mol,
+                    sanitizeOps=(
+                        Chem.SanitizeFlags.SANITIZE_FINDRADICALS
+                        | Chem.SanitizeFlags.SANITIZE_SETAROMATICITY
+                        | Chem.SanitizeFlags.SANITIZE_SETCONJUGATION
+                        | Chem.SanitizeFlags.SANITIZE_SETHYBRIDIZATION
+                        | Chem.SanitizeFlags.SANITIZE_SYMMRINGS
+                    ),
+                )
+            except Exception:
+                pass
+
+            conf = Chem.Conformer(n)
+            for i, c in enumerate(coords):
+                x, y, z = [float(v) for v in c]
+                conf.SetAtomPosition(i, Point3D(x, y, z))
+            mol.AddConformer(conf, assignId=True)
+
+            if not AllChem.UFFHasAllMoleculeParams(mol):
+                return
+            ff = AllChem.UFFGetMoleculeForceField(mol, confId=0)
+            if ff is None:
+                return
+
+            if capped_h_indices is None:
+                movable_h = {i for i, sp in enumerate(species) if sp == "H"}
+            else:
+                movable_h = {i for i in capped_h_indices if 0 <= i < len(species) and species[i] == "H"}
+
+            if not movable_h:
+                return
+
+            for i in range(n):
+                if i not in movable_h:
+                    ff.AddFixedPoint(i)
+
+            ff.Initialize()
+            ff.Minimize(maxIts=max_iters)
+
+            conf2 = mol.GetConformer(0)
+            for i in range(n):
+                p = conf2.GetAtomPosition(i)
+                coords[i] = np.array([p.x, p.y, p.z], dtype=float)
+        except Exception:
+            return
+
+    def enforce_sp2_capped_h_geometry(self, species, coords, capped_h_indices=None):
+        if not species or not capped_h_indices:
+            return
+
+        def heavy_neighbors(idx):
+            out = []
+            ci = np.array(coords[idx], dtype=float)
+            for j, sp in enumerate(species):
+                if j == idx or sp == "H":
+                    continue
+                d = np.linalg.norm(ci - np.array(coords[j], dtype=float))
+                if self.is_valid_bond(species[idx], sp, d):
+                    out.append((j, d))
+            out.sort(key=lambda x: x[1])
+            return [j for j, _ in out]
+
+        for hidx in capped_h_indices:
+            if hidx < 0 or hidx >= len(species) or species[hidx] != "H":
+                continue
+
+            hpos = np.array(coords[hidx], dtype=float)
+            parent = None
+            best = 1e9
+            for i, sp in enumerate(species):
+                if sp == "H":
+                    continue
+                d = np.linalg.norm(hpos - np.array(coords[i], dtype=float))
+                if self.is_valid_bond("H", sp, d) and d < best:
+                    best = d
+                    parent = i
+            if parent is None or species[parent] != "C":
+                continue
+
+            nbs = heavy_neighbors(parent)
+            if len(nbs) < 2:
+                continue
+
+            p = np.array(coords[parent], dtype=float)
+            u = []
+            for nb in nbs[:2]:
+                v = np.array(coords[nb], dtype=float) - p
+                nv = np.linalg.norm(v)
+                if nv > 1e-10:
+                    u.append(v / nv)
+            if len(u) < 2:
+                continue
+
+            # sp2 direction at aromatic/phenyl carbon: opposite to sum of two sigma bonds
+            dvec = -(u[0] + u[1])
+            nd = np.linalg.norm(dvec)
+            if nd < 1e-8:
+                continue
+            dvec = dvec / nd
+
+            bl = self.cap_bond_length("C")
+            new_h = p + bl * dvec
+
+            # quick collision guard with other atoms
+            clash = False
+            for j, sp in enumerate(species):
+                if j in (hidx, parent):
+                    continue
+                dj = np.linalg.norm(new_h - np.array(coords[j], dtype=float))
+                if sp == "H" and dj < 1.4:
+                    clash = True
+                    break
+                if sp != "H" and dj < 0.9:
+                    clash = True
+                    break
+            if not clash:
+                coords[hidx] = new_h
 
 
 class MOFFragmenter(BaseFragmenter):
@@ -389,6 +540,8 @@ class MOFFragmenter(BaseFragmenter):
                 zif_mode,
             )
 
+        self.refine_h_geometry_with_rdkit(final_species, final_coords, getattr(self, "_last_capped_h_indices", None))
+        self.enforce_sp2_capped_h_geometry(final_species, final_coords, getattr(self, "_last_capped_h_indices", None))
         print(f"Final size: {len(final_species)} atoms.")
         mol = Molecule(final_species, final_coords)
         mol.to(filename=output_path, fmt="xyz")
@@ -715,6 +868,7 @@ class MOFFragmenter(BaseFragmenter):
         sites = [supercell[idx] for idx in ordered_indices]
         species = [s.species_string for s in sites]
         coords = [unwrapped_coords[idx] for idx in ordered_indices]
+        capped_h_flags = [False] * len(species)
         local_index = {sc_idx: i for i, sc_idx in enumerate(ordered_indices)}
 
         bonds_by_ligand = {}
@@ -741,11 +895,11 @@ class MOFFragmenter(BaseFragmenter):
                 avg_vec = np.zeros(3)
                 for rc in removed_coords:
                     avg_vec = avg_vec + (rc - ba_pos)
-                self.place_capping_h(parent_local_idx, avg_vec, bl, species, coords, min_hh=1.5)
+                self.place_capping_h(parent_local_idx, avg_vec, bl, species, coords, min_hh=1.5, capped_h_flags=capped_h_flags)
             else:
                 for rc in removed_coords:
                     vec = rc - ba_pos
-                    self.place_capping_h(parent_local_idx, vec, bl, species, coords, min_hh=1.5)
+                    self.place_capping_h(parent_local_idx, vec, bl, species, coords, min_hh=1.5, capped_h_flags=capped_h_flags)
 
         already_capped = {ba_idx for ba_idx, _ in bridge_atoms_to_cap}
 
@@ -771,7 +925,7 @@ class MOFFragmenter(BaseFragmenter):
                 if parent_local_idx is not None:
                     if species[parent_local_idx] == "O" and self.oxygen_already_protonated(parent_local_idx, species, coords):
                         continue
-                    self.place_capping_h(parent_local_idx, avg_vec, bl, species, coords, min_hh=1.5)
+                    self.place_capping_h(parent_local_idx, avg_vec, bl, species, coords, min_hh=1.5, capped_h_flags=capped_h_flags)
 
         if not minimize:
             heavy_idx = [i for i, s in enumerate(species) if s != "H"]
@@ -823,7 +977,9 @@ class MOFFragmenter(BaseFragmenter):
                                 break
                     species = [s for i, s in enumerate(species) if i in keep]
                     coords = [c for i, c in enumerate(coords) if i in keep]
+                    capped_h_flags = [f for i, f in enumerate(capped_h_flags) if i in keep]
 
+        self._last_capped_h_indices = [i for i, f in enumerate(capped_h_flags) if f and species[i] == "H"]
         return species, coords
 
 
@@ -890,7 +1046,7 @@ class COFFragmenter(BaseFragmenter):
                 if j <= i:
                     continue
                 d = np.linalg.norm(ci - n.coords)
-                if self.is_valid_bond(si, n.species_string, d):
+                if self.is_valid_bond(si, sc_sym[j], d):
                     graph[i].append(j)
                     graph[j].append(i)
 
@@ -902,8 +1058,53 @@ class COFFragmenter(BaseFragmenter):
         path_mode = "A"
         node_atoms = set()
         core_nodes = set()
+        node_species = set()
 
-        if bo_node_atoms:
+        # Path H (COF-105-like only): large-cell Si-node SBU
+        # SBU = Si + 4 phenyl; linker branch is B-ended 3-edge side.
+        si_nodes = [i for i, el in enumerate(sc_sym) if el == "Si"]
+        if si_nodes and max(struct.lattice.abc) > 40.0:
+            h_cores = []
+            for si in si_nodes:
+                core = {si}
+                qh = deque([(si, 0)])
+                seen_h = {si}
+                while qh:
+                    u, dep = qh.popleft()
+                    if dep >= 5:
+                        continue
+                    for v in graph[u]:
+                        if v in seen_h or sc_sym[v] == "H":
+                            continue
+                        sv = sc_sym[v]
+                        if sv in {"B", "O"}:
+                            continue
+                        if sv not in {"Si", "C"}:
+                            continue
+                        seen_h.add(v)
+                        core.add(v)
+                        qh.append((v, dep + 1))
+                ccount = sum(1 for i in core if sc_sym[i] == "C")
+                if ccount >= 12:
+                    h_cores.append(core)
+
+            if h_cores:
+                def _ctr(core):
+                    return np.mean([supercell[i].coords for i in core], axis=0)
+                center_core = min(h_cores, key=lambda c: np.linalg.norm(_ctr(c) - ctr))
+                core_nodes = set(center_core)
+                node_atoms = set().union(*h_cores)
+                node_species = {"Si"}
+                if center_idx >= 0:
+                    sc_center_idx = center_idx
+                else:
+                    si_in_core = [i for i in center_core if sc_sym[i] == "Si"]
+                    pool = si_in_core if si_in_core else list(center_core)
+                    sc_center_idx = min(pool, key=lambda i: np.linalg.norm(supercell[i].coords - ctr))
+                path_mode = "H"
+                print(f"  -> COF Path H (COF-105 Si-node SBU). cores: {len(h_cores)}, core size: {len(center_core)}")
+
+        if path_mode == "A" and bo_node_atoms:
             node_species = bo_node_species
             node_atoms = set(bo_node_atoms)
 
@@ -943,6 +1144,57 @@ class COFFragmenter(BaseFragmenter):
                 el = sc_sym[i]
                 center_sig[el] = center_sig.get(el, 0) + 1
 
+            # Path I (COF-108-like only): tetra-C-centered aryl node in B/O frameworks.
+            if "Si" not in sc_sym and center_sig.get("B", 0) == 1 and center_sig.get("O", 0) == 2 and len(center_comp) == 3:
+                c_nodes = []
+                for ci in range(len(supercell)):
+                    if sc_sym[ci] != "C":
+                        continue
+                    c_nbs = [j for j in graph[ci] if sc_sym[j] == "C"]
+                    h_nbs = [j for j in graph[ci] if sc_sym[j] == "H"]
+                    if len(c_nbs) == 4 and len(h_nbs) == 0:
+                        c_nodes.append(ci)
+
+                i_cores = []
+                for c0 in c_nodes:
+                    core = {c0}
+                    qh = deque([(c0, 0)])
+                    seen_h = {c0}
+                    while qh:
+                        u, dep = qh.popleft()
+                        if dep >= 5:
+                            continue
+                        for v in graph[u]:
+                            if v in seen_h or sc_sym[v] == "H":
+                                continue
+                            sv = sc_sym[v]
+                            if sv in {"B", "O"}:
+                                continue
+                            if sv != "C":
+                                continue
+                            seen_h.add(v)
+                            core.add(v)
+                            qh.append((v, dep + 1))
+                    ccount = sum(1 for ii in core if sc_sym[ii] == "C")
+                    if ccount >= 12:
+                        i_cores.append(core)
+
+                if i_cores:
+                    def _ctr(core):
+                        return np.mean([supercell[ii].coords for ii in core], axis=0)
+                    center_core = min(i_cores, key=lambda c: np.linalg.norm(_ctr(c) - ctr))
+                    core_nodes = set(center_core)
+                    node_atoms = set().union(*i_cores)
+                    node_species = {"C"}
+                    if center_idx >= 0:
+                        sc_center_idx = center_idx
+                    else:
+                        c_in_core = [ii for ii in center_core if sc_sym[ii] == "C"]
+                        pool = c_in_core if c_in_core else list(center_core)
+                        sc_center_idx = min(pool, key=lambda ii: np.linalg.norm(supercell[ii].coords - ctr))
+                    path_mode = "I"
+                    print(f"  -> COF Path I (COF-108 tetra-C node SBU). cores: {len(i_cores)}, core size: {len(center_core)}")
+
             layered_candidates = []
             center_list = list(center_comp)
             for comp in node_comps:
@@ -964,7 +1216,7 @@ class COFFragmenter(BaseFragmenter):
                             min_d = d
                 layered_candidates.append((min_d, comp))
 
-            if layered_candidates:
+            if path_mode == "A" and layered_candidates:
                 layered_candidates.sort(key=lambda x: x[0])
                 best_d, best_comp = layered_candidates[0]
                 if 1.0 <= best_d <= 4.5:
@@ -973,10 +1225,10 @@ class COFFragmenter(BaseFragmenter):
 
             if path_mode == "B":
                 print(f"  -> COF Path B (Layered pair). Node components: 2, spacing: {best_d:.2f} A")
-            else:
+            elif path_mode == "A":
                 print(f"  -> COF Path A (Single node). Node component size: {len(center_comp)}")
 
-        else:
+        elif path_mode == "A":
             # Path C for COF-3xx-like families: use tetra-connected central
             # carbon nodes (carbon bonded to 4 heavy neighbors, mostly carbons).
             c4_nodes = []
@@ -1129,6 +1381,7 @@ class COFFragmenter(BaseFragmenter):
         local = {gi: li for li, gi in enumerate(ordered)}
         species = [sc_sym[i] for i in ordered]
         coords = [np.array(unwrapped[i]) for i in ordered]
+        capped_h_flags = [False] * len(species)
 
         broken_by_parent = {}
         for gi, vec in broken:
@@ -1166,9 +1419,110 @@ class COFFragmenter(BaseFragmenter):
                 for v in vecs:
                     dir_vec += v
 
-            self.place_capping_h(li, dir_vec, self.cap_bond_length(species[li]), species, coords, min_hh=1.5)
+            # Cap only true cut sites. Number of H is computed from local
+            # valence deficit after cut, and limited by number of broken bonds.
+            target_valence = {"C": 4, "B": 3, "Si": 4, "N": 3, "O": 2}
+            sp = species[li]
+            n_broken = len(vecs)
+            if sp in target_valence and n_broken > 0:
+                # local coordination in current fragment (after cut)
+                cur_deg = 0
+                li_pos = np.array(coords[li])
+                for jj in range(len(species)):
+                    if jj == li:
+                        continue
+                    d = np.linalg.norm(li_pos - np.array(coords[jj]))
+                    if self.is_valid_bond(sp, species[jj], d):
+                        cur_deg += 1
+                deficit = max(0, target_valence[sp] - cur_deg)
+                n_cap = min(n_broken, deficit)
 
-        if minimize and species:
+                # oxygen special-case: avoid protonating already protonated O
+                if sp == "O" and self.oxygen_already_protonated(li, species, coords):
+                    n_cap = 0
+
+                for _ in range(n_cap):
+                    self.place_capping_h(li, dir_vec, self.cap_bond_length(sp), species, coords, min_hh=1.5, capped_h_flags=capped_h_flags)
+
+        if minimize and species and path_mode == "H":
+            heavy_idx = [i for i, sp in enumerate(species) if sp != "H"]
+            if heavy_idx:
+                hadj = {i: [] for i in heavy_idx}
+                for a in range(len(heavy_idx)):
+                    i = heavy_idx[a]
+                    ci = np.array(coords[i])
+                    for b in range(a + 1, len(heavy_idx)):
+                        j = heavy_idx[b]
+                        d = np.linalg.norm(ci - np.array(coords[j]))
+                        if self.is_valid_bond(species[i], species[j], d):
+                            hadj[i].append(j)
+                            hadj[j].append(i)
+
+                local_nodes = {local[g] for g in core_nodes if g in local}
+                organic = [i for i in heavy_idx if i not in local_nodes]
+                organic_set = set(organic)
+
+                comps = []
+                vis = set()
+                for i in organic:
+                    if i in vis:
+                        continue
+                    q = deque([i])
+                    vis.add(i)
+                    comp = {i}
+                    while q:
+                        u = q.popleft()
+                        for v in hadj[u]:
+                            if v in organic_set and v not in vis:
+                                vis.add(v)
+                                comp.add(v)
+                                q.append(v)
+                    comps.append(comp)
+
+                best = None
+                best_key = None
+                for comp in comps:
+                    touch = 0
+                    bterm = 0
+                    for u in comp:
+                        if any(v in local_nodes for v in hadj[u]):
+                            touch += 1
+                        if species[u] == "B":
+                            bterm += 1
+                    key = (touch, bterm, len(comp))
+                    if best_key is None or key > best_key:
+                        best_key = key
+                        best = comp
+
+                keep_heavy = set(local_nodes)
+                if best is not None:
+                    keep_heavy |= set(best)
+
+                # Preserve Si/B attached to retained phenyl carbons.
+                for i in heavy_idx:
+                    if species[i] not in {"Si", "B"}:
+                        continue
+                    if i in keep_heavy or any((nb in keep_heavy and species[nb] == "C") for nb in hadj.get(i, [])):
+                        keep_heavy.add(i)
+
+                keep = set(keep_heavy)
+                for i, sp in enumerate(species):
+                    if sp != "H":
+                        continue
+                    ci = np.array(coords[i])
+                    for j in keep_heavy:
+                        if j >= len(coords):
+                            continue
+                        d = np.linalg.norm(ci - np.array(coords[j]))
+                        if self.is_valid_bond("H", species[j], d):
+                            keep.add(i)
+                            break
+
+                species = [x for i, x in enumerate(species) if i in keep]
+                coords = [x for i, x in enumerate(coords) if i in keep]
+                capped_h_flags = [x for i, x in enumerate(capped_h_flags) if i in keep]
+
+        if minimize and species and path_mode != "H":
             # COF minimize target:
             # 1) keep one whole linker branch
             # 2) for other branches keep only first benzene ring near node
@@ -1286,6 +1640,15 @@ class COFFragmenter(BaseFragmenter):
                                     q.append(v)
                         keep_heavy |= set(carbons)
 
+                # Preserve adjacent C atoms for Path A COFs (e.g., COF-102) so
+                # linker carbons are not over-pruned before capping.
+                if path_mode == "A":
+                    for cidx in heavy_idx:
+                        if species[cidx] != "C" or cidx in keep_heavy:
+                            continue
+                        if any((nb in keep_heavy and species[nb] in {"B", "O", "C"}) for nb in hadj.get(cidx, [])):
+                            keep_heavy.add(cidx)
+
                 # Preserve N atoms adjacent to kept carbon fragments (important
                 # for porphyrinic / imine motifs in COF-3xx), then add capping H
                 # if those N become terminal after trimming.
@@ -1294,6 +1657,18 @@ class COFFragmenter(BaseFragmenter):
                         continue
                     if any((nb in keep_heavy and species[nb] in {"C", "N"}) for nb in hadj[nidx]):
                         keep_heavy.add(nidx)
+
+                # Preserve Si attached to retained phenyl carbons.
+                for i in heavy_idx:
+                    if i >= len(species) or species[i] != "Si":
+                        continue
+                    if i in keep_heavy or any((nb in keep_heavy and species[nb] == "C") for nb in hadj.get(i, [])):
+                        keep_heavy.add(i)
+
+                # Track how many heavy neighbors each kept atom loses during minimize trim.
+                removed_nbr_count = {}
+                for ii in keep_heavy:
+                    removed_nbr_count[ii] = sum(1 for nb in hadj.get(ii, []) if nb not in keep_heavy)
 
                 # Keep hydrogens bonded to retained heavy atoms.
                 keep = set(keep_heavy)
@@ -1307,8 +1682,47 @@ class COFFragmenter(BaseFragmenter):
                             keep.add(i)
                             break
 
+                kept_idx = [i for i in range(len(species)) if i in keep]
+                old_to_new = {old_i: new_i for new_i, old_i in enumerate(kept_idx)}
                 species = [x for i, x in enumerate(species) if i in keep]
                 coords = [x for i, x in enumerate(coords) if i in keep]
+                capped_h_flags = [x for i, x in enumerate(capped_h_flags) if i in keep]
+
+                # Cap only carbons that became dangling due to minimize trim.
+                for old_i, n_removed in removed_nbr_count.items():
+                    if n_removed <= 0:
+                        continue
+                    new_i = old_to_new.get(old_i)
+                    if new_i is None:
+                        continue
+                    if species[new_i] != "C":
+                        continue
+
+                    # Current coordination in trimmed fragment
+                    cpos = np.array(coords[new_i])
+                    nbs = []
+                    for j in range(len(species)):
+                        if j == new_i:
+                            continue
+                        d = np.linalg.norm(cpos - np.array(coords[j]))
+                        if self.is_valid_bond("C", species[j], d):
+                            nbs.append(j)
+
+                    cur_deg = len(nbs)
+                    deficit = max(0, 4 - cur_deg)
+                    n_cap = min(n_removed, deficit)
+                    if n_cap <= 0:
+                        continue
+
+                    base = np.zeros(3)
+                    if nbs:
+                        for nb in nbs:
+                            base -= (np.array(coords[nb]) - cpos)
+                    else:
+                        base = np.array([1.0, 0.0, 0.0])
+
+                    for _ in range(n_cap):
+                        self.place_capping_h(new_i, base, self.cap_bond_length("C"), species, coords, min_hh=1.5, capped_h_flags=capped_h_flags)
 
                 # Post-trim N capping: if retained N has low retained valence,
                 # place one H opposite to kept neighbors.
@@ -1336,7 +1750,40 @@ class COFFragmenter(BaseFragmenter):
                             base -= (np.array(coords[nb]) - np.array(coords[i]))
                     else:
                         base = np.array([1.0, 0.0, 0.0])
-                    self.place_capping_h(i, base, self.cap_bond_length("N"), species, coords, min_hh=1.5)
+                    self.place_capping_h(i, base, self.cap_bond_length("N"), species, coords, min_hh=1.5, capped_h_flags=capped_h_flags)
+
+        # Final minimize Si/B capping: cap undercoordinated Si/B with one H.
+        if minimize and species:
+            hidx = [i for i, sp in enumerate(species) if sp != "H"]
+            hadj_si = {i: [] for i in hidx}
+            for a in range(len(hidx)):
+                i = hidx[a]
+                ci = np.array(coords[i])
+                for b in range(a + 1, len(hidx)):
+                    j = hidx[b]
+                    d = np.linalg.norm(ci - np.array(coords[j]))
+                    if self.is_valid_bond(species[i], species[j], d):
+                        hadj_si[i].append(j)
+                        hadj_si[j].append(i)
+
+            for i, sp in list(enumerate(species)):
+                if sp not in {"Si", "B"}:
+                    continue
+                hcut = 1.7 if sp == "Si" else 1.5
+                has_h = any(species[j] == "H" and np.linalg.norm(np.array(coords[i]) - np.array(coords[j])) <= hcut for j in range(len(species)))
+                if has_h:
+                    continue
+                kept_nbs = hadj_si.get(i, [])
+                target_val = 4 if sp == "Si" else 3
+                if len(kept_nbs) >= target_val:
+                    continue
+                base = np.zeros(3)
+                if kept_nbs:
+                    for nb in kept_nbs:
+                        base -= (np.array(coords[nb]) - np.array(coords[i]))
+                else:
+                    base = np.array([1.0, 0.0, 0.0])
+                self.place_capping_h(i, base, self.cap_bond_length(sp), species, coords, min_hh=1.5, capped_h_flags=capped_h_flags)
 
         # Keep a single connected component for Path A.
         # For Path B (stacked dimer-like layers), keep both principal layers.
@@ -1367,7 +1814,8 @@ class COFFragmenter(BaseFragmenter):
                 comps.append(comp)
             if len(comps) > 1:
                 def comp_key(comp):
-                    node_ct = sum(1 for k in comp if species[k] in {"B", "O"})
+                    ns = node_species if node_species else {"B", "O"}
+                    node_ct = sum(1 for k in comp if species[k] in ns)
                     return (node_ct, len(comp))
                 if path_mode == "B":
                     ranked = sorted(comps, key=comp_key, reverse=True)
@@ -1376,7 +1824,11 @@ class COFFragmenter(BaseFragmenter):
                     keep = max(comps, key=comp_key)
                 species = [x for i, x in enumerate(species) if i in keep]
                 coords = [x for i, x in enumerate(coords) if i in keep]
+                capped_h_flags = [x for i, x in enumerate(capped_h_flags) if i in keep]
 
+        capped_h_indices = [i for i, is_cap in enumerate(capped_h_flags) if is_cap and species[i] == "H"]
+        self.refine_h_geometry_with_rdkit(species, coords, capped_h_indices=capped_h_indices)
+        self.enforce_sp2_capped_h_geometry(species, coords, capped_h_indices)
         print(f"Final size: {len(species)} atoms")
         mol = Molecule(species, coords)
         mol.to(filename=output_path, fmt="xyz")
