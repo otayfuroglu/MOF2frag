@@ -1216,15 +1216,22 @@ class COFFragmenter(BaseFragmenter):
                             min_d = d
                 layered_candidates.append((min_d, comp))
 
+            layered_component_count = 1
             if path_mode == "A" and layered_candidates:
                 layered_candidates.sort(key=lambda x: x[0])
                 best_d, best_comp = layered_candidates[0]
                 if 1.0 <= best_d <= 4.5:
-                    core_nodes |= set(best_comp)
+                    # Some stacked COFs have two symmetry-equivalent neighboring
+                    # node components at the same interlayer spacing. Keep all
+                    # tied neighbors so one equivalent linker is not dropped.
+                    same_layer = [comp for d, comp in layered_candidates if abs(d - best_d) <= 0.05]
+                    for comp in same_layer:
+                        core_nodes |= set(comp)
+                    layered_component_count += len(same_layer)
                     path_mode = "B"
 
             if path_mode == "B":
-                print(f"  -> COF Path B (Layered pair). Node components: 2, spacing: {best_d:.2f} A")
+                print(f"  -> COF Path B (Layered set). Node components: {layered_component_count}, spacing: {best_d:.2f} A")
             elif path_mode == "A":
                 print(f"  -> COF Path A (Single node). Node component size: {len(center_comp)}")
 
