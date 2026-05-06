@@ -163,6 +163,12 @@ For each item:
 - Consequences: ZnPc-COF now uses Path D (Metallo-PC core dimer). Normal keeps the two stacked ZnPc layers plus all connected benzene-1,4-diboronic acid linkers and cuts only far-side O-C bonds so far B-connected O atoms are H-capped: 242 atoms, Zn2 B16 H64 C112 N16 O32. Minimized keeps the two stacked ZnPc layers plus one full BDBA linker per layer, retains the ZnPc-core fused benzene perimeter, caps discarded linker attachment points with H, and uses the same far-side O-H termination: 146 atoms, Zn2 B4 H40 C76 N16 O8. COF-366 remains Path D porphyrin; COF-202 remains Path B layered set.
 - Alternatives considered: Leave ZnPc as Path B; rejected because the intended SBU is the metallo-phthalocyanine core.
 
+### Decision 2026-05-06: Directly combine coffragmentor node and linker for metallo-PC minimum fragments
+- Context: The failed helper-selection approach was undone. `coffragmentor.py` should provide the actual node/linker molecular fragments for ZnPc minimum fragments.
+- Decision: Metallo-PC COFs now try Path J: combine one Zn/N-rich coffragmentor node molecule with coffragmentor linker molecule image(s), then duplicate the pair/set along the shortest lattice vector for the ZnPc dimer. Minimized mode keeps one nearest attached linker image; normal mode keeps all neighboring-cell linker images that chemically attach to the node.
+- Consequences: ZnPc-DPB normal/min are 322/166 atoms; ZnPc-COF normal/min are 210/138 atoms. Non-metallo-PC COFs fall back to existing paths.
+- Alternatives considered: coffragmentor-assisted UniFrag linker selection; reverted.
+
 ## 10) Operational Notes
 
 ### 10.1 Common failure modes

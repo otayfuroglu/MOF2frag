@@ -1010,8 +1010,113 @@ class COFFragmenter(BaseFragmenter):
         cutoff = min(2.2, max(1.1, cutoff))
         return dist <= cutoff
 
+    def _try_coffragmentor_node_linker_fragment(self, cif_path, output_path, minimize=False):
+        try:
+            from coffragmentor import COF
+        except Exception as exc:
+            print(f"  coffragmentor unavailable: {exc}")
+            return None
+        metal_pc_species = {"Zn", "Cu", "Fe", "Co", "Ni", "Mn"}
+        try:
+            struct = Structure.from_file(cif_path)
+        except Exception as exc:
+            print(f"  coffragmentor combine failed: {exc}")
+            return None
+        if not any(getattr(site.specie, "symbol", None) in metal_pc_species for site in struct):
+            return None
+        try:
+            result = COF.from_cif(cif_path).fragment()
+        except Exception as exc:
+            print(f"  coffragmentor combine failed: {exc}")
+            return None
+
+        nodes = [sbu for sbu in getattr(result, "nodes", []) if getattr(sbu, "molecule", None) is not None]
+        linkers = [sbu for sbu in getattr(result, "linkers", []) if getattr(sbu, "molecule", None) is not None]
+        if not nodes or not linkers:
+            return None
+
+        zn_nodes = []
+        for node in nodes:
+            sp = [str(x) for x in node.molecule.species]
+            if any(x in metal_pc_species for x in sp) and sp.count("N") >= 4:
+                zn_nodes.append(node)
+        if not zn_nodes:
+            return None
+
+        center = struct.lattice.get_cartesian_coords([0.5, 0.5, 0.5])
+        node = min(zn_nodes, key=lambda s: np.linalg.norm(np.mean(s.molecule.cart_coords, axis=0) - center))
+        node_sp = [str(x) for x in node.molecule.species]
+        node_co = [np.array(c, dtype=float) for c in node.molecule.cart_coords]
+        node_ctr = np.mean(node_co, axis=0)
+
+        image_vectors = []
+        for ia in (-1, 0, 1):
+            for ib in (-1, 0, 1):
+                for ic in (-1, 0, 1):
+                    shift_img = (
+                        ia * np.array(struct.lattice.matrix[0], dtype=float)
+                        + ib * np.array(struct.lattice.matrix[1], dtype=float)
+                        + ic * np.array(struct.lattice.matrix[2], dtype=float)
+                    )
+                    image_vectors.append(shift_img)
+
+        def linker_image_score(linker, image_shift):
+            lsp = [str(x) for x in linker.molecule.species]
+            lco = [np.array(c, dtype=float) + image_shift for c in linker.molecule.cart_coords]
+            bo = 0
+            cn = 0
+            min_d = float("inf")
+            for i, si in enumerate(node_sp):
+                for j, sj in enumerate(lsp):
+                    d = float(np.linalg.norm(node_co[i] - lco[j]))
+                    min_d = min(min_d, d)
+                    if {si, sj} == {"B", "O"} and self.is_valid_bond(si, sj, d):
+                        bo += 1
+                    if {si, sj} == {"C", "N"} and self.is_valid_bond(si, sj, d):
+                        cn += 1
+            lctr = np.mean(lco, axis=0)
+            return (bo + cn, -min_d, -float(np.linalg.norm(lctr - node_ctr)))
+
+        scored_images = []
+        for linker in linkers:
+            for image_shift in image_vectors:
+                score = linker_image_score(linker, image_shift)
+                if score[0] > 0:
+                    scored_images.append((score, linker, image_shift))
+        if not scored_images:
+            for linker in linkers:
+                for image_shift in image_vectors:
+                    scored_images.append((linker_image_score(linker, image_shift), linker, image_shift))
+        scored_images.sort(key=lambda x: x[0], reverse=True)
+        selected_images = scored_images[:1] if minimize else [item for item in scored_images if item[0][0] > 0]
+
+        species = list(node_sp)
+        coords = list(node_co)
+        for _, linker, image_shift in selected_images:
+            species.extend(str(x) for x in linker.molecule.species)
+            coords.extend(np.array(c, dtype=float) + image_shift for c in linker.molecule.cart_coords)
+
+        # ZnPc COFs are stacked; keep the two-layer dimer by translating the
+        # node+linker fragment along the shortest lattice vector. This uses
+        # coffragmentor chemistry for node/linker choice and avoids UniFrag's
+        # internal linker truncation guesses.
+        axis = int(np.argmin(struct.lattice.abc))
+        shift = np.array(struct.lattice.matrix[axis], dtype=float)
+        species = species + list(species)
+        coords = coords + [np.array(c, dtype=float) + shift for c in coords]
+
+        mol = Molecule(species, coords)
+        mol.to(filename=output_path, fmt="xyz")
+        print("  -> COF Path J (coffragmentor node+linker combine).")
+        print(f"Final size: {len(species)} atoms")
+        print(f"Saved: {output_path}")
+        return FragmentResult(species=species, coords=coords)
+
     def extract(self, cif_path, output_path="cof_fragment.xyz", center_idx=-1, minimize=False):
         print(f"Loading '{cif_path}'...")
+        combined = self._try_coffragmentor_node_linker_fragment(cif_path, output_path, minimize=minimize)
+        if combined is not None:
+            return combined
         try:
             struct = Structure.from_file(cif_path)
         except Exception as exc:

@@ -2,6 +2,26 @@
 
 Chronological handoff log for agents working on UniFrag. Add newest entries at the top. Each entry should include changed files, validation, decisions, and follow-up risks.
 
+## 2026-05-06 - Apply direct coffragmentor combine to normal/min ZnPc
+- Changed files:
+  - `fragmentation_oop.py`
+  - `project-memory.md`
+  - `project-decisions.md`
+  - `project-agent-log.md`
+  - `test_on_cof_zn_pc_series/ZnPc-COF_frag_cof_min.xyz`
+  - `test_on_cof_zn_pc_series/ZnPc-DPB_frag_cof_min.xyz`
+- Summary:
+  - Reverted the failed coffragmentor index/formula helper-selection machinery.
+  - Added metallo-PC Path J for both normal and minimized fragments. It directly combines a Zn/N-rich `coffragmentor.py` node molecule with coffragmentor linker molecule image(s), including neighboring-cell images for normal fragments so all four node sides are represented, then duplicates the pair/set along the shortest lattice vector for the ZnPc dimer.
+  - Normal ZnPc fragments remain on existing UniFrag Path D.
+- Validation:
+  - `python -m py_compile fragmentation_oop.py coffragmentor.py` passes.
+  - ZnPc-DPB normal Path J: 322 atoms, `Zn2 B16 H80 C192 N16 O16`; minimized Path J: 166 atoms, `Zn2 B4 H32 C96 N16 O16`.
+  - ZnPc-COF normal Path J: 210 atoms, `Zn2 B16 H48 C112 N16 O16`; minimized Path J: 138 atoms, `Zn2 B4 H24 C76 N16 O16`.
+  - Regression minimized checks: COF-202 70 atoms, COF-300 74 atoms, COF-366 107 atoms.
+- Follow-up risks:
+  - Path J intentionally trusts coffragmentor node/linker molecules. Visual inspection should decide whether the combined node+linker pair needs an additional neighboring node/image or terminal capping in a later pass.
+
 ## 2026-05-04 - ZnPc minimized dimer linker balance
 - Changed files:
   - `fragmentation_oop.py`
