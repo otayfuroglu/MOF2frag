@@ -2,6 +2,39 @@
 
 Chronological handoff log for agents working on UniFrag. Add newest entries at the top. Each entry should include changed files, validation, decisions, and follow-up risks.
 
+## 2026-07-22 - UniFrag: COF Minimization Mode Keeps 1 Full Linker + First-Ring Attached Linkers (`COF_TpAzo`)
+- **Changed files:**
+  - `fragmentation_oop.py` [MODIFY] — Updated `_try_coffragmentor_node_linker_fragment` when `minimize=True` to keep **1 full attached linker** (first/primary arm) and trim all remaining attached linkers around the node to their **first connected ring**.
+  - `runUniFrag/test_for_paper/COF_TpAzo/cifs/fragmentation_summary.csv` [MODIFY] — Re-generated summary CSV for `COF-TpAzo.cif`.
+  - `runUniFrag/test_for_paper/COF_TpAzo/cifs/fragments_collection.extxyz` [MODIFY] — Re-generated ExtXYZ collection for `COF-TpAzo.cif`.
+- **Summary:**
+  - Updated COF minimization mode to match MOF minimization behavior: exactly **1 attached linker remains FULL**, while all other attached linkers around the central node are trimmed to their first connected ring.
+  - Re-generated `COF-TpAzo` fragments:
+    - `COF-TpAzoFragCofMin`: 144 atoms (`C66 H56 N16 O6`), 2 stacked layers (dimer mode). Each 72-atom layer contains **5 six-membered rings**: 1 central ketoenamine/Tp ring + 2 rings on Arm 1 (the 1 FULL azobenzene linker) + 1 ring on Arm 2 (trimmed) + 1 ring on Arm 3 (trimmed).
+    - Close pairs (< 0.8 Å): **0**.
+    - Monomer electron count: 302 e- after QM fix (`68` atoms `C33 H24 N8 O3`, even count, closed-shell singlet, 100% QM ready).
+- **Validation:**
+  - Fast test suite (`./run_fast_test.sh`): **8/8 passed**.
+- **Follow-up risks:**
+  - None.
+
+## 2026-07-22 - UniFrag: Updated COF Minimization to Include First Ring Around Node for All Arms (`COF_TpAzo`)
+- **Changed files:**
+  - `fragmentation_oop.py` [MODIFY] — Moved `_get_first_ring_keep_heavy` and `_first_connected_ring_fragment` to `BaseFragmenter`. Updated `_try_coffragmentor_node_linker_fragment` and `_try_cof_graph_node_linker_fragment` to select best image shifts for ALL attached linkers around the node and trim each linker to its first connected ring when `minimize=True`.
+  - `runUniFrag/test_for_paper/COF_TpAzo/cifs/fragmentation_summary.csv` [MODIFY] — Summary CSV updated for `COF-TpAzo.cif`.
+  - `runUniFrag/test_for_paper/COF_TpAzo/cifs/fragments_collection.extxyz` [MODIFY] — ExtXYZ collection updated for `COF-TpAzo.cif`.
+- **Summary:**
+  - Diagnosed and updated COF minimization logic: previously when `minimize=True`, `_try_coffragmentor_node_linker_fragment` selected only 1 linker arm (`scored_images[:1]`) and kept that 1 linker full (all 26 atoms), leaving the other arms unattached.
+  - Updated the COF minimization pipeline so that for every attached arm around the node, the best periodic image is selected and trimmed to its first connected ring using `_first_connected_ring_fragment`.
+  - Verified on `runUniFrag/test_for_paper/COF_TpAzo/cifs/COF-TpAzo.cif`:
+    - `COF-TpAzoFragCofMin`: 120 atoms (`C54 H48 N12 O6`), 2 connected stacked layers (dimer mode). Each 60-atom layer contains 4 six-membered rings: 1 central ketoenamine/Tp ring + 3 attached first-ring phenyl arms (1 per arm).
+    - Close pairs (< 0.8 Å): **0**.
+    - Electron count for 54-atom monomer: 246 e- (even, closed-shell singlet, 100% QM ready).
+- **Validation:**
+  - Fast test suite (`./run_fast_test.sh`): **8/8 passed**.
+- **Follow-up risks:**
+  - None.
+
 ## 2026-07-22 - UniFrag: Restored Single-H Capping for Raw CIF Missing Hydrogens (`LOTTEW.cif`)
 - **Changed files:**
   - `fragmentation_oop.py` [MODIFY] — Added a single-H completion pass in `_extract_sbu_cluster` specifically targeting undercoordinated aromatic ring carbons (`len(c_nbs) == 2 and total_val == 2`).

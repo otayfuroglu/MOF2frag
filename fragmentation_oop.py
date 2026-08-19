@@ -985,173 +985,6 @@ class BaseFragmenter:
                 
         return clean_species, clean_coords
 
-class MOFFragmenter(BaseFragmenter):
-    METALS = {"Mg", "Zn", "Cu", "Fe", "Co", "Ni", "Mn", "Zr", "Ti", "V", "Cr", "Al"}
-    LARGE_NON_METALS = {"Br", "I", "S", "P", "Cl"}
-
-    def _unwrap_hydrogens(self, struct):
-        try:
-            lattice = struct.lattice
-            heavy_indices = [i for i, s in enumerate(struct) if s.species_string != "H"]
-            h_indices = [i for i, s in enumerate(struct) if s.species_string == "H"]
-            if not heavy_indices or not h_indices:
-                return struct
-            for hi in h_indices:
-                h_site = struct[hi]
-                best_d = float("inf")
-                best_heavy = None
-                for i in heavy_indices:
-                    d = struct.get_distance(hi, i)
-                    if d < best_d:
-                        best_d = d
-                        best_heavy = i
-                if best_heavy is not None and best_d < 1.35:
-                    heavy_site = struct[best_heavy]
-                    cart_d = np.linalg.norm(h_site.coords - heavy_site.coords)
-                    if cart_d > 1.35:
-                        frac_diff = h_site.frac_coords - heavy_site.frac_coords
-                        shift = np.round(frac_diff)
-                        new_frac = h_site.frac_coords - shift
-                        struct.replace(hi, h_site.species, new_frac, coords_are_cartesian=False)
-            return struct
-        except Exception:
-            return struct
-
-    def _load_clean_structure(self, mof_path):
-        try:
-            struct = Structure.from_file(mof_path, occupancy_tolerance=100.0)
-            to_keep = []
-            for i in range(len(struct)):
-                dup = False
-                for kept in to_keep:
-                    d = struct.get_distance(i, kept)
-                    if d < 0.8:
-                        dup = True
-                        break
-                if not dup:
-                    to_keep.append(i)
-            struct = Structure.from_sites([struct[idx] for idx in to_keep])
-            struct = self._unwrap_hydrogens(struct)
-            return struct
-        except Exception:
-            return None
-
-    def is_valid_bond(self, s1_str, s2_str, dist):
-        if s1_str in self.METALS or s2_str in self.METALS:
-            if "C" in (s1_str, s2_str) or "H" in (s1_str, s2_str):
-                return False
-            return dist < 2.6
-        if "H" in (s1_str, s2_str):
-            return dist < 1.2
-        if s1_str in self.LARGE_NON_METALS or s2_str in self.LARGE_NON_METALS:
-            return dist < 2.2
-        return dist < 1.8
-
-    @staticmethod
-    def _safe_name(text):
-        safe = []
-        for ch in str(text):
-            safe.append(ch if ch.isalnum() or ch in {"-", "_"} else "_")
-        return "".join(safe).strip("_") or "fragment"
-
-    @staticmethod
-    def _species_coords_unique_key(species, coords, decimals=3):
-        species = [str(sp) for sp in species]
-        coords = [np.array(c, dtype=float) for c in coords]
-        counts = tuple(sorted((sp, species.count(sp)) for sp in set(species)))
-        if len(coords) <= 1:
-            return counts, ()
-
-        distances = []
-        for i in range(len(coords)):
-            for j in range(i + 1, len(coords)):
-                pair = tuple(sorted((species[i], species[j])))
-                d = round(float(np.linalg.norm(coords[i] - coords[j])), decimals)
-                distances.append((pair[0], pair[1], d))
-        return counts, tuple(sorted(distances))
-
-    @classmethod
-    def _molecule_unique_key(cls, mol, decimals=3):
-        return cls._species_coords_unique_key(mol.species, mol.cart_coords, decimals=decimals)
-
-    @classmethod
-    def _xyz_unique_key(cls, path, decimals=3):
-        species = []
-        coords = []
-        for line in Path(path).read_text().splitlines()[2:]:
-            parts = line.split()
-            if len(parts) < 4:
-                continue
-            species.append(parts[0])
-            coords.append(np.array([float(x) for x in parts[1:4]], dtype=float))
-        if not species:
-            return None
-        return cls._chemical_identity_key(species, coords, decimals=decimals)
-
-
-
-    def _append_merged_atoms(self, species, coords, add_species, add_coords, tol=0.08):
-        for sp, coord in zip(add_species, add_coords):
-            c = np.array(coord, dtype=float)
-            duplicate = False
-            for i, old_sp in enumerate(species):
-                if old_sp != sp:
-                    continue
-                if np.linalg.norm(np.array(coords[i], dtype=float) - c) <= tol:
-                    duplicate = True
-                    break
-            if not duplicate:
-                species.append(sp)
-                coords.append(c)
-
-    def _cap_path_j_open_oxygens(self, species, coords, capped_h_flags):
-        heavy_idx = [i for i, sp in enumerate(species) if sp != "H"]
-        capped_central_atoms = set()
-
-        for i in list(heavy_idx):
-            if i >= len(species) or species[i] != "O":
-                continue
-            if self.oxygen_already_protonated(i, species, coords):
-                opos = np.array(coords[i], dtype=float)
-                for j in heavy_idx:
-                    if i == j: continue
-                    d = np.linalg.norm(opos - np.array(coords[j], dtype=float))
-                    if self.is_valid_bond("O", species[j], d):
-                        if species[j] in ("C", "P", "S"):
-                            capped_central_atoms.add(j)
-
-        for i in list(heavy_idx):
-            if i >= len(species) or species[i] != "O":
-                continue
-            if self.oxygen_already_protonated(i, species, coords):
-                continue
-            opos = np.array(coords[i], dtype=float)
-            heavy_neighbors = []
-            has_metal = False
-            for j, spj in enumerate(species):
-                if i == j or spj == "H":
-                    continue
-                d = np.linalg.norm(opos - np.array(coords[j], dtype=float))
-                if self.is_valid_bond("O", spj, d):
-                    heavy_neighbors.append(j)
-                    if spj in self.METALS:
-                        has_metal = True
-            # Open carboxylate/terminal oxygens from helper linkers have only
-            # the carbonyl/carboxyl carbon left after the missing node was cut.
-            if has_metal or len(heavy_neighbors) != 1 or species[heavy_neighbors[0]] not in ("C", "P", "S"):
-                continue
-
-            central_idx = heavy_neighbors[0]
-            if central_idx in capped_central_atoms:
-                continue
-
-            base = opos - np.array(coords[central_idx], dtype=float)
-            cap_len = self.cap_bond_length("O")
-            before = len(species)
-            self.place_capping_h(i, base, cap_len, species, coords, min_hh=1.5, capped_h_flags=capped_h_flags)
-            if len(species) == before and np.linalg.norm(base) > 1e-12:
-                self.place_capping_h(i, -base, cap_len, species, coords, min_hh=1.5, capped_h_flags=capped_h_flags)
-
     def _get_first_ring_keep_heavy(self, hadj, bridge_atoms, species_map=None):
         ring_edges = set()
         ring_nodes = set()
@@ -1318,6 +1151,173 @@ class MOFFragmenter(BaseFragmenter):
                 h_nbs += 1
 
         return out_species, out_coords, out_flags
+
+class MOFFragmenter(BaseFragmenter):
+    METALS = {"Mg", "Zn", "Cu", "Fe", "Co", "Ni", "Mn", "Zr", "Ti", "V", "Cr", "Al"}
+    LARGE_NON_METALS = {"Br", "I", "S", "P", "Cl"}
+
+    def _unwrap_hydrogens(self, struct):
+        try:
+            lattice = struct.lattice
+            heavy_indices = [i for i, s in enumerate(struct) if s.species_string != "H"]
+            h_indices = [i for i, s in enumerate(struct) if s.species_string == "H"]
+            if not heavy_indices or not h_indices:
+                return struct
+            for hi in h_indices:
+                h_site = struct[hi]
+                best_d = float("inf")
+                best_heavy = None
+                for i in heavy_indices:
+                    d = struct.get_distance(hi, i)
+                    if d < best_d:
+                        best_d = d
+                        best_heavy = i
+                if best_heavy is not None and best_d < 1.35:
+                    heavy_site = struct[best_heavy]
+                    cart_d = np.linalg.norm(h_site.coords - heavy_site.coords)
+                    if cart_d > 1.35:
+                        frac_diff = h_site.frac_coords - heavy_site.frac_coords
+                        shift = np.round(frac_diff)
+                        new_frac = h_site.frac_coords - shift
+                        struct.replace(hi, h_site.species, new_frac, coords_are_cartesian=False)
+            return struct
+        except Exception:
+            return struct
+
+    def _load_clean_structure(self, mof_path):
+        try:
+            struct = Structure.from_file(mof_path, occupancy_tolerance=100.0)
+            to_keep = []
+            for i in range(len(struct)):
+                dup = False
+                for kept in to_keep:
+                    d = struct.get_distance(i, kept)
+                    if d < 0.8:
+                        dup = True
+                        break
+                if not dup:
+                    to_keep.append(i)
+            struct = Structure.from_sites([struct[idx] for idx in to_keep])
+            struct = self._unwrap_hydrogens(struct)
+            return struct
+        except Exception:
+            return None
+
+    def is_valid_bond(self, s1_str, s2_str, dist):
+        if s1_str in self.METALS or s2_str in self.METALS:
+            if "C" in (s1_str, s2_str) or "H" in (s1_str, s2_str):
+                return False
+            return dist < 2.6
+        if "H" in (s1_str, s2_str):
+            return dist < 1.2
+        if s1_str in self.LARGE_NON_METALS or s2_str in self.LARGE_NON_METALS:
+            return dist < 2.2
+        return dist < 1.8
+
+    @staticmethod
+    def _safe_name(text):
+        safe = []
+        for ch in str(text):
+            safe.append(ch if ch.isalnum() or ch in {"-", "_"} else "_")
+        return "".join(safe).strip("_") or "fragment"
+
+    @staticmethod
+    def _species_coords_unique_key(species, coords, decimals=3):
+        species = [str(sp) for sp in species]
+        coords = [np.array(c, dtype=float) for c in coords]
+        counts = tuple(sorted((sp, species.count(sp)) for sp in set(species)))
+        if len(coords) <= 1:
+            return counts, ()
+
+        distances = []
+        for i in range(len(coords)):
+            for j in range(i + 1, len(coords)):
+                pair = tuple(sorted((species[i], species[j])))
+                d = round(float(np.linalg.norm(coords[i] - coords[j])), decimals)
+                distances.append((pair[0], pair[1], d))
+        return counts, tuple(sorted(distances))
+
+    @classmethod
+    def _molecule_unique_key(cls, mol, decimals=3):
+        return cls._species_coords_unique_key(mol.species, mol.cart_coords, decimals=decimals)
+
+    @classmethod
+    def _xyz_unique_key(cls, path, decimals=3):
+        species = []
+        coords = []
+        for line in Path(path).read_text().splitlines()[2:]:
+            parts = line.split()
+            if len(parts) < 4:
+                continue
+            species.append(parts[0])
+            coords.append(np.array([float(x) for x in parts[1:4]], dtype=float))
+        if not species:
+            return None
+        return cls._chemical_identity_key(species, coords, decimals=decimals)
+
+
+
+    def _append_merged_atoms(self, species, coords, add_species, add_coords, tol=0.08):
+        for sp, coord in zip(add_species, add_coords):
+            c = np.array(coord, dtype=float)
+            duplicate = False
+            for i, old_sp in enumerate(species):
+                if old_sp != sp:
+                    continue
+                if np.linalg.norm(np.array(coords[i], dtype=float) - c) <= tol:
+                    duplicate = True
+                    break
+            if not duplicate:
+                species.append(sp)
+                coords.append(c)
+
+    def _cap_path_j_open_oxygens(self, species, coords, capped_h_flags):
+        heavy_idx = [i for i, sp in enumerate(species) if sp != "H"]
+        capped_central_atoms = set()
+
+        for i in list(heavy_idx):
+            if i >= len(species) or species[i] != "O":
+                continue
+            if self.oxygen_already_protonated(i, species, coords):
+                opos = np.array(coords[i], dtype=float)
+                for j in heavy_idx:
+                    if i == j: continue
+                    d = np.linalg.norm(opos - np.array(coords[j], dtype=float))
+                    if self.is_valid_bond("O", species[j], d):
+                        if species[j] in ("C", "P", "S"):
+                            capped_central_atoms.add(j)
+
+        for i in list(heavy_idx):
+            if i >= len(species) or species[i] != "O":
+                continue
+            if self.oxygen_already_protonated(i, species, coords):
+                continue
+            opos = np.array(coords[i], dtype=float)
+            heavy_neighbors = []
+            has_metal = False
+            for j, spj in enumerate(species):
+                if i == j or spj == "H":
+                    continue
+                d = np.linalg.norm(opos - np.array(coords[j], dtype=float))
+                if self.is_valid_bond("O", spj, d):
+                    heavy_neighbors.append(j)
+                    if spj in self.METALS:
+                        has_metal = True
+            # Open carboxylate/terminal oxygens from helper linkers have only
+            # the carbonyl/carboxyl carbon left after the missing node was cut.
+            if has_metal or len(heavy_neighbors) != 1 or species[heavy_neighbors[0]] not in ("C", "P", "S"):
+                continue
+
+            central_idx = heavy_neighbors[0]
+            if central_idx in capped_central_atoms:
+                continue
+
+            base = opos - np.array(coords[central_idx], dtype=float)
+            cap_len = self.cap_bond_length("O")
+            before = len(species)
+            self.place_capping_h(i, base, cap_len, species, coords, min_hh=1.5, capped_h_flags=capped_h_flags)
+            if len(species) == before and np.linalg.norm(base) > 1e-12:
+                self.place_capping_h(i, -base, cap_len, species, coords, min_hh=1.5, capped_h_flags=capped_h_flags)
 
     def _recover_open_node_linkers_from_structure(self, struct, node_species, node_coords, species, coords, minimize=False):
         recovered = []
@@ -3198,13 +3198,8 @@ class COFFragmenter(BaseFragmenter):
             n_linkers = linker_neighbors(nidx)
             if not n_linkers:
                 continue
-            if minimize:
-                picked = max(n_linkers, key=lk_key)
-                selected_linkers.append(picked)
-                keep_comps.add(picked)
-            else:
-                selected_linkers.extend(sorted(n_linkers))
-                keep_comps |= set(n_linkers)
+            selected_linkers.extend(sorted(n_linkers))
+            keep_comps |= set(n_linkers)
 
         if not selected_linkers:
             return None
@@ -3485,15 +3480,21 @@ class COFFragmenter(BaseFragmenter):
             return (attach_bonds, -min_d, -float(np.linalg.norm(lctr - node_ctr)))
 
         scored_images = []
-        for linker in linkers:
+        for idx, linker in enumerate(linkers):
             for image_shift in image_vectors:
                 score = linker_image_score(linker, image_shift)
                 if score[0] > 0:
-                    scored_images.append((score, linker, image_shift))
+                    scored_images.append((score, idx, linker, image_shift))
         if not scored_images:
             return None
         scored_images.sort(key=lambda x: x[0], reverse=True)
-        selected_images = scored_images[:1] if minimize else scored_images
+
+        seen_linkers = set()
+        selected_images = []
+        for score, idx, linker, image_shift in scored_images:
+            if idx not in seen_linkers:
+                seen_linkers.add(idx)
+                selected_images.append((score, linker, image_shift))
 
         def append_merged(species, coords, add_species, add_coords, tol=0.08):
             for sp, coord in zip(add_species, add_coords):
@@ -3512,10 +3513,20 @@ class COFFragmenter(BaseFragmenter):
         species = []
         coords = []
         append_merged(species, coords, node_sp, node_co)
-        for _, linker, image_shift in selected_images:
+        for i_img, (_, linker, image_shift) in enumerate(selected_images):
             lsp = [str(x) for x in linker.molecule.species]
             lco = [np.array(c, dtype=float) + image_shift for c in linker.molecule.cart_coords]
-            append_merged(species, coords, lsp, lco)
+            if minimize:
+                if i_img == 0:
+                    append_merged(species, coords, lsp, lco)
+                else:
+                    out_sp, out_co, out_fl = self._first_connected_ring_fragment(lsp, lco, node_sp, node_co)
+                    if out_sp:
+                        append_merged(species, coords, out_sp, out_co)
+                    else:
+                        append_merged(species, coords, lsp, lco)
+            else:
+                append_merged(species, coords, lsp, lco)
 
         capped_h_flags = [False] * len(species)
 
