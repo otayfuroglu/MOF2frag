@@ -2,7 +2,30 @@
 
 Chronological handoff log for agents working on UniFrag. Add newest entries at the top. Each entry should include changed files, validation, decisions, and follow-up risks.
 
-## 2026-07-22 - UniFrag: COF Minimization Mode Keeps 1 Full Linker + First-Ring Attached Linkers (`COF_TpAzo`)
+## 2026-08-20 - UniFrag: HPC Slurm Batch Test on All Mg-based MOFs (`~/RemoteARF/...`)
+- **Changed files:**
+  - `~/RemoteARF/uniFrag_works/runUniFrag/coreMOFs/analyze_soap.py` [NEW] — Restored and configured SOAP analysis script in the HPC dataset folder.
+  - `~/RemoteARF/uniFrag_works/runUniFrag/coreMOFs/mg_cr_cifs_noduplicated/submit_mg_unifrag.sh` [NEW] — Slurm batch submission script for `debug` partition on `arf` HPC.
+  - `~/RemoteARF/uniFrag_works/runUniFrag/coreMOFs/mg_cr_cifs_noduplicated/fragmentation_summary.csv` [MODIFY] — Re-generated summary CSV for all 75 Mg MOFs via Slurm.
+  - `~/RemoteARF/uniFrag_works/runUniFrag/coreMOFs/mg_cr_cifs_noduplicated/fragments_collection.extxyz` [MODIFY] — Filtered ExtXYZ collection (113 retained frames, 26 eliminated >200 atoms).
+  - `~/RemoteARF/uniFrag_works/runUniFrag/coreMOFs/mg_cr_cifs_noduplicated/mg_soap_analysis_*.md` [MODIFY] — Re-generated multi-cutoff SOAP similarity reports.
+  - `~/RemoteARF/uniFrag_works/runUniFrag/coreMOFs/mg_cr_cifs_noduplicated/mg_soap_distribution_*.png` [MODIFY] — Re-generated multi-cutoff SOAP PCA/UMAP plots.
+- **Summary:**
+  - Submitted Slurm batch job (Job ID: `6265286`) to partition `debug` across 20 cores (`barbun16`) to fragment all 75 Mg-based MOFs in `/arf/scratch/otayfuroglu/uniFrag_works/runUniFrag/coreMOFs/mg_cr_cifs_noduplicated/cifs`.
+  - Filtered large fragments with >200 atoms (`filter_large_fragments.py`), retaining 113 high-quality QM-ready fragments and moving 26 large fragments to `eliminated_fragments.extxyz`.
+  - Re-computed SOAP coordination fingerprints across cutoffs $r_{\text{cut}} = 3.0, 4.0, 5.0, 6.0\text{ \AA}$.
+- **Validation:**
+  - All 75 Mg MOFs completed cleanly without any timeout or error.
+  - SOAP representation:
+    - $r_{\text{cut}} = 3.0\text{ \AA}$: **99.25%** Highly Represented (531 / 535 centers $\ge 0.98$).
+    - $r_{\text{cut}} = 4.0\text{ \AA}$: **98.50%** Highly Represented (527 / 535 centers $\ge 0.98$).
+    - $r_{\text{cut}} = 5.0\text{ \AA}$: **89.16%** Highly Represented (477 / 535 centers $\ge 0.98$).
+    - $r_{\text{cut}} = 6.0\text{ \AA}$: **82.62%** Highly Represented (442 / 535 centers $\ge 0.98$).
+    - Poorly represented ($< 0.90$): **0.00%** across all cutoffs.
+- **Follow-up risks:**
+  - None.
+
+
 - **Changed files:**
   - `fragmentation_oop.py` [MODIFY] — Updated `_try_coffragmentor_node_linker_fragment` when `minimize=True` to keep **1 full attached linker** (first/primary arm) and trim all remaining attached linkers around the node to their **first connected ring**.
   - `runUniFrag/test_for_paper/COF_TpAzo/cifs/fragmentation_summary.csv` [MODIFY] — Re-generated summary CSV for `COF-TpAzo.cif`.
